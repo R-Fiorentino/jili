@@ -1,0 +1,307 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function resolvedRole(data) {
+      return data.app_role is string
+        ? data.app_role
+        : (data.role is string ? data.role : "user");
+    }
+
+    function isUserAnalystOrDeveloper(role) {
+      return role == "user" || role == "analyst" || role == "developer" || role == "tech_supervisor";
+    }
+
+    function areRoleFieldsConsistent(data) {
+      return !(data.app_role is string && data.role is string) || data.app_role == data.role;
+    }
+
+    function currentUser() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function hasUserProfile() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function currentEmail() {
+      return normalizedEmail(request.auth.token.email);
+    }
+
+    function hasRole(role) {
+      return hasUserProfile() && (
+        currentUser().app_role == role ||
+        currentUser().role == role
+      );
+    }
+
+    function isAdmin() {
+      return hasRole("admin");
+    }
+
+    function isAnalystOrAdmin() {
+      return hasRole("analyst") || isAdmin();
+    }
+
+    function isSelf(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function normalizedEmail(value) {
+      return value is string ? value.lower() : "";
+    }
+
+    function isSafeSelfProfileWrite() {
+      let newRole = resolvedRole(request.resource.data);
+      return isUserAnalystOrDeveloper(newRole) &&
+        areRoleFieldsConsistent(request.resource.data) &&
+        // Self updates cannot promote to admin
+        newRole != "admin";
+    }
+
+    function isSafeSelfProfileCreate() {
+      let newRole = resolvedRole(request.resource.data);
+      return isUserAnalystOrDeveloper(newRole) &&
+        areRoleFieldsConsistent(request.resource.data);
+    }
+
+    function isAssignedDeveloper() {
+      return isSignedIn() &&
+        (hasRole("developer") || hasRole("tech_supervisor")) &&
+        (
+          resource.data.assignee_email == request.auth.token.email ||
+          request.resource.data.assignee_email == request.auth.token.email
+        );
+    }
+
+    function isSelfDeveloperProfileWrite() {
+      return isSignedIn() &&
+        (hasRole("developer") || hasRole("tech_supervisor")) &&
+        (
+          normalizedEmail(resource.data.email) == normalizedEmail(request.auth.token.email) ||
+          normalizedEmail(request.resource.data.email) == normalizedEmail(request.auth.token.email)
+        ) &&
+        request.resource.data.diff(resource.data).changedKeys().hasOnly([
+          "unavailable_slots",
+          "recurring_unavailable_slots",
+          "updated_date",
+          "updated_at"
+        ]);
+    }
+
+    function clientExists(clientId) {
+      return clientId is string &&
+        clientId != "" &&
+        exists(/databases/$(database)/documents/clients/$(clientId));
+    }
+
+    function clientData(clientId) {
+      return get(/databases/$(database)/documents/clients/$(clientId)).data;
+    }
+
+    function developerData(developerId) {
+      return get(/databases/$(database)/documents/developers/$(developerId)).data;
+    }
+
+    function ticketClientId() {
+      return request.resource.data.client_id is string
+        ? request.resource.data.client_id
+        : (resource.data.client_id is string ? resource.data.client_id : "");
+    }
+
+    function currentTicketAssigneeId() {
+      return resource.data.assignee_id is string ? resource.data.assignee_id : "";
+    }
+
+    function nextTicketAssigneeId() {
+      return request.resource.data.assignee_id is string
+        ? request.resource.data.assignee_id
+        : currentTicketAssigneeId();
+    }
+
+    function isTechSupervisorForClient(clientId) {
+      let client = clientData(clientId);
+      let supervisorId = client.tech_supervisor_id is string ? client.tech_supervisor_id : "";
+      let supervisorEmail = normalizedEmail(client.tech_supervisor_email);
+      let supervisorMatchesByEmail = supervisorEmail != "" && supervisorEmail == currentEmail();
+      let supervisorMatchesByDeveloper =
+        supervisorId != "" &&
+        exists(/databases/$(database)/documents/developers/$(supervisorId)) &&
+        normalizedEmail(developerData(supervisorId).email) == currentEmail();
+
+      return hasRole("tech_supervisor") && (supervisorMatchesByEmail || supervisorMatchesByDeveloper);
+    }
+
+    function isOperationsAssigneeForClient(clientId, assigneeId) {
+      let client = clientData(clientId);
+      let developerEmail =
+        assigneeId != "" &&
+        exists(/databases/$(database)/documents/developers/$(assigneeId))
+          ? developerData(assigneeId).email
+          : "";
+      let developerName =
+        assigneeId != "" &&
+        exists(/databases/$(database)/documents/developers/$(assigneeId)) &&
+        developerData(assigneeId).name is string
+          ? developerData(assigneeId).name
+          : "";
+      return client.operations_ids is list &&
+        assigneeId is string &&
+        assigneeId != "" &&
+        (
+          assigneeId in client.operations_ids ||
+          (
+            client.operations_names is list &&
+            (
+              developerEmail in client.operations_names ||
+              developerName in client.operations_names
+            )
+          )
+        );
+    }
+
+    function isTechSupervisorClientTicketWrite() {
+      let clientId = ticketClientId();
+      let currentAssigneeId = currentTicketAssigneeId();
+      let nextAssigneeId = nextTicketAssigneeId();
+
+      return clientExists(clientId) &&
+        request.resource.data.client_id == resource.data.client_id &&
+        isTechSupervisorForClient(clientId) &&
+        currentAssigneeId != "" &&
+        nextAssigneeId != "" &&
+        isOperationsAssigneeForClient(clientId, currentAssigneeId) &&
+        isOperationsAssigneeForClient(clientId, nextAssigneeId);
+    }
+
+    function isDeveloperQaReviewCreate() {
+      let kind = request.resource.data.ticket_kind is string
+        ? request.resource.data.ticket_kind
+        : "";
+      let clientId = request.resource.data.client_id is string
+        ? request.resource.data.client_id
+        : "";
+      let parentId = request.resource.data.parent_ticket_id is string
+        ? request.resource.data.parent_ticket_id
+        : "";
+      let sourceId = request.resource.data.qa_source_ticket_id is string
+        ? request.resource.data.qa_source_ticket_id
+        : "";
+      let parentExists = parentId != "" && exists(/databases/$(database)/documents/tickets/$(parentId));
+      let sourceExists = sourceId != "" && exists(/databases/$(database)/documents/tickets/$(sourceId));
+      let parentTicket = parentExists
+        ? get(/databases/$(database)/documents/tickets/$(parentId)).data
+        : null;
+      let sourceTicket = sourceExists
+        ? get(/databases/$(database)/documents/tickets/$(sourceId)).data
+        : null;
+      let client = clientExists(clientId) ? clientData(clientId) : null;
+
+      return hasRole("developer") &&
+        kind == "qa_review" &&
+        clientId != "" &&
+        parentExists &&
+        sourceExists &&
+        parentTicket.client_id == clientId &&
+        sourceTicket.client_id == clientId &&
+        normalizedEmail(sourceTicket.assignee_email) == currentEmail() &&
+        (
+          (
+            client.tech_supervisor_id is string &&
+            client.tech_supervisor_id != "" &&
+            request.resource.data.assignee_id == client.tech_supervisor_id
+          ) ||
+          (
+            client.tech_supervisor_email is string &&
+            normalizedEmail(client.tech_supervisor_email) != "" &&
+            normalizedEmail(request.resource.data.assignee_email) == normalizedEmail(client.tech_supervisor_email)
+          )
+        );
+    }
+
+    // User profile documents
+    match /users/{userId} {
+      allow read: if isSignedIn();
+
+      // First profile bootstrap (cannot self-assign admin)
+      allow create: if isSelf(userId) && isSafeSelfProfileCreate();
+
+      // Users can update their own profile among user/analyst/developer only
+      allow update: if isSelf(userId) && isSafeSelfProfileWrite();
+
+      // Admin can manage any user
+      allow update, delete: if isAdmin();
+    }
+
+    // Core entities
+    match /clients/{id} {
+      allow read: if isSignedIn();
+      allow write: if isAnalystOrAdmin() || hasRole("tech_supervisor");
+    }
+
+    match /developers/{id} {
+      allow read: if isSignedIn();
+
+      // Allow developer profile creation during onboarding
+      allow create: if isSignedIn();
+
+      allow update: if isAnalystOrAdmin() || isSelfDeveloperProfileWrite();
+      allow delete: if isAnalystOrAdmin();
+    }
+
+    match /priorityConfigs/{id} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /dailySyncLocks/{id} {
+      allow read: if isSignedIn();
+      allow create: if isAnalystOrAdmin();
+      allow update, delete: if false;
+    }
+
+    match /tickets/{id} {
+      allow read: if isSignedIn();
+      allow create: if isAnalystOrAdmin() || hasRole("tech_supervisor") || isDeveloperQaReviewCreate();
+      allow delete: if isAnalystOrAdmin();
+      allow update: if isAnalystOrAdmin() || isAssignedDeveloper() || isTechSupervisorClientTicketWrite();
+    }
+
+    match /notifications/{id} {
+      allow read: if isAdmin() ||
+        (isSignedIn() && resource.data.recipient_id == request.auth.uid);
+
+      allow create: if isSignedIn() &&
+        request.resource.data.recipient_id is string &&
+        request.resource.data.recipient_id != "" &&
+        request.resource.data.actor_id == request.auth.uid;
+
+      allow update: if isAdmin() ||
+        (
+          isSignedIn() &&
+          resource.data.recipient_id == request.auth.uid &&
+          request.resource.data.recipient_id == resource.data.recipient_id &&
+          request.resource.data.actor_id == resource.data.actor_id
+        );
+
+      allow delete: if isAdmin() ||
+        (isSignedIn() && resource.data.recipient_id == request.auth.uid);
+    }
+
+    match /appLogs/{id} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn() &&
+        request.resource.data.user_id == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // Deny everything else by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

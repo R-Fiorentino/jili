@@ -1,0 +1,137 @@
+{
+  "name": "Developer",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Developer full name"
+    },
+    "email": {
+      "type": "string",
+      "description": "Developer email"
+    },
+    "daily_capacity": {
+      "type": "number",
+      "default": 8,
+      "description": "Available hours per day"
+    },
+    "active": {
+      "type": "boolean",
+      "default": true
+    },
+    "avatar_color": {
+      "type": "string",
+      "description": "Color for avatar display"
+    },
+    "absences": {
+      "type": "array",
+      "description": "List of absence dates (YYYY-MM-DD)",
+      "items": {
+        "type": "object",
+        "properties": {
+          "date": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "unavailable_slots": {
+      "type": "array",
+      "description": "Partial-day non-working slots where ticket planning is blocked",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique slot identifier"
+          },
+          "date": {
+            "type": "string",
+            "description": "Date YYYY-MM-DD"
+          },
+          "start_time": {
+            "type": "string",
+            "description": "Start time HH:MM"
+          },
+          "end_time": {
+            "type": "string",
+            "description": "End time HH:MM"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "absence",
+              "call",
+              "activity"
+            ],
+            "description": "Slot category"
+          },
+          "label": {
+            "type": "string",
+            "description": "Optional human-friendly note"
+          }
+        }
+      }
+    },
+    "recurring_unavailable_slots": {
+      "type": "array",
+      "description": "Recurring weekly non-working slots",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique recurring rule id"
+          },
+          "weekdays": {
+            "type": "array",
+            "description": "ISO weekdays where 1=Mon ... 7=Sun",
+            "items": {
+              "type": "number"
+            }
+          },
+          "start_time": {
+            "type": "string",
+            "description": "Start time HH:MM"
+          },
+          "end_time": {
+            "type": "string",
+            "description": "End time HH:MM"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "absence",
+              "call",
+              "activity"
+            ],
+            "description": "Rule category"
+          },
+          "label": {
+            "type": "string",
+            "description": "Optional human-friendly note"
+          },
+          "start_date": {
+            "type": "string",
+            "description": "Rule activation date YYYY-MM-DD"
+          },
+          "end_date": {
+            "type": "string",
+            "description": "Optional rule end date YYYY-MM-DD"
+          },
+          "active": {
+            "type": "boolean",
+            "description": "Whether the recurring rule is active"
+          }
+        }
+      }
+    }
+  },
+  "required": [
+    "name",
+    "email"
+  ]
+}

@@ -1,0 +1,111 @@
+{
+  "name": "PriorityConfig",
+  "type": "object",
+  "properties": {
+    "config_key": {
+      "type": "string",
+      "default": "default",
+      "description": "Config identifier"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "standard"
+      ],
+      "default": "standard",
+      "description": "Priority calculation mode (single mode)"
+    },
+    "age_coefficient": {
+      "type": "number",
+      "default": 2,
+      "description": "Multiplier for days since ticket creation"
+    },
+    "difficulty_scores": {
+      "type": "object",
+      "description": "Score per difficulty level",
+      "properties": {
+        "easy": {
+          "type": "number",
+          "default": 10
+        },
+        "medium": {
+          "type": "number",
+          "default": 20
+        },
+        "hard": {
+          "type": "number",
+          "default": 35
+        }
+      }
+    },
+    "tier_scores": {
+      "type": "object",
+      "description": "Score per client tier (ridotto per bilanciare)",
+      "properties": {
+        "P1": {
+          "type": "number",
+          "default": 50
+        },
+        "P2": {
+          "type": "number",
+          "default": 35
+        },
+        "P3": {
+          "type": "number",
+          "default": 20
+        },
+        "P4": {
+          "type": "number",
+          "default": 5
+        }
+      }
+    },
+    "deadline_bonus": {
+      "type": "object",
+      "description": "Bonus score based on deadline proximity",
+      "properties": {
+        "overdue": {
+          "type": "number",
+          "default": 35
+        },
+        "today": {
+          "type": "number",
+          "default": 20
+        },
+        "next_3_days": {
+          "type": "number",
+          "default": 10
+        },
+        "next_7_days": {
+          "type": "number",
+          "default": 4
+        }
+      }
+    },
+    "effort_penalty_per_hour": {
+      "type": "number",
+      "default": 0.5,
+      "description": "Penalty points subtracted for each estimated hour"
+    },
+    "report_permissions": {
+      "type": "object",
+      "description": "Role-based permissions for test report editing and generation",
+      "properties": {
+        "edit_roles": {
+          "type": "array",
+          "description": "Roles allowed to edit and generate report test data",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "admin",
+            "analyst"
+          ]
+        }
+      }
+    }
+  },
+  "required": [
+    "config_key"
+  ]
+}

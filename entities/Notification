@@ -1,0 +1,78 @@
+{
+  "name": "Notification",
+  "type": "object",
+  "properties": {
+    "recipient_id": {
+      "type": "string",
+      "description": "User id that receives the notification"
+    },
+    "recipient_email": {
+      "type": "string",
+      "description": "Denormalized recipient email"
+    },
+    "actor_id": {
+      "type": "string",
+      "description": "User id that triggered the event"
+    },
+    "actor_email": {
+      "type": "string",
+      "description": "Denormalized actor email"
+    },
+    "actor_name": {
+      "type": "string",
+      "description": "Denormalized actor display name"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "ticket_assigned",
+        "ticket_comment",
+        "ticket_done",
+        "generic"
+      ],
+      "default": "generic"
+    },
+    "title": {
+      "type": "string",
+      "description": "Notification title"
+    },
+    "body": {
+      "type": "string",
+      "description": "Optional notification body"
+    },
+    "read": {
+      "type": "boolean",
+      "default": false,
+      "description": "Read flag"
+    },
+    "read_at": {
+      "type": "string",
+      "description": "ISO timestamp when marked as read"
+    },
+    "ticket_id": {
+      "type": "string",
+      "description": "Optional linked ticket id"
+    },
+    "ticket_title": {
+      "type": "string",
+      "description": "Denormalized linked ticket title"
+    },
+    "link": {
+      "type": "string",
+      "description": "In-app navigation target"
+    },
+    "event_at": {
+      "type": "string",
+      "description": "Event timestamp"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Additional event metadata"
+    }
+  },
+  "required": [
+    "recipient_id",
+    "type",
+    "title"
+  ]
+}

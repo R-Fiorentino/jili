@@ -1,0 +1,79 @@
+{
+  "name": "Client",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Client/company name"
+    },
+    "priority_tier": {
+      "type": "string",
+      "enum": [
+        "P1",
+        "P2",
+        "P3",
+        "P4"
+      ],
+      "default": "P3",
+      "description": "Priority tier"
+    },
+    "color": {
+      "type": "string",
+      "default": "#6366f1",
+      "description": "Hex color used to identify the client in planning views"
+    },
+    "priority_score": {
+      "type": "number",
+      "default": 20,
+      "description": "Numeric priority score (P1=50, P2=35, P3=20, P4=5)"
+    },
+    "notes": {
+      "type": "string",
+      "description": "Additional notes about the client"
+    },
+    "active": {
+      "type": "boolean",
+      "default": true
+    },
+    "tech_supervisor_id": {
+      "type": "string",
+      "description": "Developer ID assigned as tech supervisor"
+    },
+    "tech_supervisor_name": {
+      "type": "string",
+      "description": "Denormalized tech supervisor name"
+    },
+    "operations_ids": {
+      "type": "array",
+      "description": "List of developer IDs assigned as operations",
+      "items": {
+        "type": "string"
+      }
+    },
+    "operations_names": {
+      "type": "array",
+      "description": "Denormalized operations names",
+      "items": {
+        "type": "string"
+      }
+    },
+    "analyst_team_ids": {
+      "type": "array",
+      "description": "List of user IDs assigned as analysts for this client",
+      "items": {
+        "type": "string"
+      }
+    },
+    "analyst_team_names": {
+      "type": "array",
+      "description": "Denormalized analyst team names",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "name",
+    "priority_tier"
+  ]
+}

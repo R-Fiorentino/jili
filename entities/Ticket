@@ -1,0 +1,194 @@
+{
+  "name": "Ticket",
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "Ticket title"
+    },
+    "description": {
+      "type": "string",
+      "description": "Detailed description"
+    },
+    "client_id": {
+      "type": "string",
+      "description": "Reference to Client"
+    },
+    "client_name": {
+      "type": "string",
+      "description": "Denormalized client name"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "ab_test",
+        "cro",
+        "tracking",
+        "ui_change",
+        "bug_fix",
+        "other"
+      ],
+      "default": "ab_test",
+      "description": "Type of task"
+    },
+    "difficulty": {
+      "type": "string",
+      "enum": [
+        "easy",
+        "medium",
+        "hard"
+      ],
+      "default": "medium",
+      "description": "Test difficulty"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "new",
+        "needs_effort",
+        "ready",
+        "in_progress",
+        "qa_review",
+        "done",
+        "blocked"
+      ],
+      "default": "new",
+      "description": "Pipeline status"
+    },
+    "effort_hours": {
+      "type": "number",
+      "description": "Actual effort in hours (consuntivo, valorizzato a fine attività)"
+    },
+    "proposed_effort": {
+      "type": "number",
+      "description": "Planned effort in hours (usato per pianificazione)"
+    },
+    "assignee_id": {
+      "type": "string",
+      "description": "Assigned developer ID"
+    },
+    "assignee_name": {
+      "type": "string",
+      "description": "Denormalized assignee name"
+    },
+    "assignee_email": {
+      "type": "string",
+      "description": "Denormalized assignee email"
+    },
+    "priority_score": {
+      "type": "number",
+      "default": 0,
+      "description": "Auto-calculated priority score"
+    },
+    "priority_override": {
+      "type": "number",
+      "description": "Manual priority override by admin"
+    },
+    "link": {
+      "type": "string",
+      "description": "External link (e.g. Figma, doc)"
+    },
+    "attachments": {
+      "type": "array",
+      "description": "File attachments",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "deadline": {
+      "type": "string",
+      "format": "date",
+      "description": "Optional deadline"
+    },
+    "scheduled_date": {
+      "type": "string",
+      "format": "date",
+      "description": "Scheduled execution date (first day)"
+    },
+    "start_time": {
+      "type": "string",
+      "description": "Start time HH:MM on scheduled_date"
+    },
+    "end_time": {
+      "type": "string",
+      "description": "End time HH:MM on scheduled_date (may be DAY_END if multi-day)"
+    },
+    "continuation_schedule": {
+      "type": "array",
+      "description": "For multi-day tickets: list of continuation days with times",
+      "items": {
+        "type": "object",
+        "properties": {
+          "date": {
+            "type": "string",
+            "description": "YYYY-MM-DD"
+          },
+          "start_time": {
+            "type": "string",
+            "description": "HH:MM"
+          },
+          "end_time": {
+            "type": "string",
+            "description": "HH:MM"
+          }
+        }
+      }
+    },
+    "audit_log": {
+      "type": "array",
+      "description": "Change history",
+      "items": {
+        "type": "object",
+        "properties": {
+          "timestamp": {
+            "type": "string"
+          },
+          "user": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string"
+          },
+          "details": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "comments": {
+      "type": "array",
+      "description": "Comments thread",
+      "items": {
+        "type": "object",
+        "properties": {
+          "timestamp": {
+            "type": "string"
+          },
+          "user": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "test_report": {
+      "type": "object",
+      "description": "Structured test report data and generated output for completed tickets"
+    }
+  },
+  "required": [
+    "title",
+    "description",
+    "client_id"
+  ]
+}
