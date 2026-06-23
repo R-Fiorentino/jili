@@ -460,29 +460,6 @@ function formatDateTimeLabel(dateStr, timeStr) {
   return `${dateLabel} ${timeStr}`.trim();
 }
 
-function getPlanningStartAfterSafeDays(baseDate = null, protectedWorkingDays = 3) {
-  const cursor = baseDate
-    ? moment(baseDate, "YYYY-MM-DD", true).startOf("day")
-    : moment().startOf("day");
-  if (!cursor.isValid()) {
-    return moment().startOf("day").format("YYYY-MM-DD");
-  }
-
-  let protectedCount = 0;
-  while (protectedCount < protectedWorkingDays) {
-    if (cursor.isoWeekday() <= 5) {
-      protectedCount += 1;
-    }
-    cursor.add(1, "day");
-  }
-
-  while (cursor.isoWeekday() > 5) {
-    cursor.add(1, "day");
-  }
-
-  return cursor.format("YYYY-MM-DD");
-}
-
 function isAbsenceDay(dev, dateStr) {
   if (!dev || !Array.isArray(dev.absences)) return false;
   return dev.absences.some((absence) => absence?.date === dateStr);
@@ -1241,6 +1218,7 @@ export default function TicketDetail() {
         ...getDynamicRebalanceOptions({
           preserveWorkingDaysFromToday: 0,
           preserveExistingSequence: false,
+          forceFirstTicketIds: [targetTicketId],
           ...(insertBeforeNextActivity
             ? {
                 includeTodayHoles: true,
@@ -2339,6 +2317,32 @@ export default function TicketDetail() {
 
     const nowInfo = getNowInRome();
     const nowTime = nowInfo.time;
+    const previousStatus = normalizeTicketStatus(ticket.status);
+    const isReactivatingFromBlocked =
+      previousStatus === "blocked" &&
+      newStatus !== "blocked" &&
+      !isClosedStatus(newStatus);
+    const clearMissingDataOnReactivation =
+      isReactivatingFromBlocked && ticket?.missing_required_data === true;
+    const reactivationData = clearMissingDataOnReactivation
+      ? {
+          missing_required_data: false,
+          missing_required_data_reported_at: null,
+          missing_required_data_reported_by: null,
+          missing_required_data_reported_by_id: null,
+          priority_override: null,
+          priority_score: calculatePriorityScore(
+            {
+              ...ticket,
+              status: newStatus,
+              missing_required_data: false,
+              priority_override: null,
+            },
+            client,
+            config
+          ),
+        }
+      : {};
     const timeData = {};
     let resolvedCompletionDateForRebalance = null;
     let resolvedCompletionTimeForRebalance = null;
@@ -2386,6 +2390,12 @@ export default function TicketDetail() {
       }
     }
     if (newStatus === "blocked") {
+      timeData.scheduled_date = null;
+      timeData.start_time = null;
+      timeData.end_time = null;
+      timeData.continuation_schedule = [];
+    }
+    if (isReactivatingFromBlocked && newStatus !== "in_progress") {
       timeData.scheduled_date = null;
       timeData.start_time = null;
       timeData.end_time = null;
@@ -2439,12 +2449,65 @@ export default function TicketDetail() {
       : (timeData.end_time || null);
 
     await updateMutation.mutateAsync({
-      data: { status: newStatus, ...timeData, ...extraData },
+      data: { status: newStatus, ...timeData, ...reactivationData, ...extraData },
       auditAction,
       auditDetails:
         auditDetails ||
         `Status: ${normalizeTicketStatus(ticket.status)} → ${newStatus}${auditStartTime ? ` (start: ${auditStartTime})` : ""}${auditEndTime ? ` (end: ${auditEndTime})` : ""}`,
     });
+
+    if (isReactivatingFromBlocked && ticket.assignee_id) {
+      if (newStatus === "in_progress") {
+        const anchorStart = timeToDecimal(timeData.start_time);
+        await applyRebalanceForDevelopers([ticket.assignee_id], {
+          freezeTicketIds: [ticket.id],
+          preserveWorkingDaysFromToday: 0,
+          preserveExistingSequence: true,
+          includeTodayHoles: true,
+          freezeCurrentWeekSegments: false,
+          preserveTodaySegments: false,
+          planningStartDate: timeData.scheduled_date || nowInfo.date,
+          ...(Number.isFinite(anchorStart) && timeData.scheduled_date
+            ? {
+                manualInsertionAnchor: {
+                  date: timeData.scheduled_date,
+                  start: anchorStart,
+                },
+              }
+            : {}),
+        });
+        return;
+      }
+
+      const reactivationDeveloper = resolveTicketAssigneeDeveloper(ticket);
+      if (reactivationDeveloper) {
+        await schedulePriorityInsertionBeforeNew({
+          developer: reactivationDeveloper,
+          ticketId: ticket.id,
+          insertBeforeNextActivity: true,
+        });
+        await queryClient.invalidateQueries({ queryKey: ["ticket", ticketId] });
+        await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+        return;
+      }
+
+      await applyRebalanceForDevelopers([ticket.assignee_id], {
+        preserveWorkingDaysFromToday: 0,
+        preserveExistingSequence: false,
+        includeTodayHoles: true,
+        freezeCurrentWeekSegments: false,
+        preserveTodaySegments: false,
+        preserveElapsedTodaySegments: true,
+        allowInProgressReplan: true,
+        forceFirstTicketIds: [ticket.id],
+        planningStartDate: nowInfo.date,
+        manualInsertionAnchor: {
+          date: nowInfo.date,
+          start: nowInfo.roundedDecimal ?? DAY_START,
+        },
+      });
+      return;
+    }
 
     const rebalanceOptions = isCompletionStatus && !wasCompletionStatus
       ? (() => {
@@ -3577,10 +3640,9 @@ export default function TicketDetail() {
           { ...ticket, status: nextStatus, missing_required_data: false, priority_override: null },
           client,
           config
-        );
+    );
     const currentScheduleSegments = getTicketScheduleSegments(ticket);
     const anchorSegment = currentScheduleSegments[0] || null;
-    const planningAfterSafeDays = getPlanningStartAfterSafeDays(moment().format("YYYY-MM-DD"), 3);
 
     await updateMutation.mutateAsync({
       data: {
@@ -3591,14 +3653,10 @@ export default function TicketDetail() {
         priority_override: nextPaused ? 0 : null,
         priority_score: nextPriorityScore,
         status: nextStatus,
-        ...(nextPaused
-          ? {
-              scheduled_date: null,
-              start_time: null,
-              end_time: null,
-              continuation_schedule: [],
-            }
-          : {}),
+        scheduled_date: null,
+        start_time: null,
+        end_time: null,
+        continuation_schedule: [],
       },
       auditAction: nextPaused ? "missing_data_reported" : "missing_data_cleared",
       auditDetails: nextPaused
@@ -3633,42 +3691,62 @@ export default function TicketDetail() {
       });
     }
 
-    await applyRebalanceForDevelopers([ticket.assignee_id], {
-      ...(nextPaused
-        ? {
-            preserveWorkingDaysFromToday: 0,
-            preserveExistingSequence: true,
-            includeTodayHoles: true,
-            freezeCurrentWeekSegments: false,
-            preserveTodaySegments: false,
-            allowInProgressReplan: true,
-            forceLastTicketIds: [ticket.id],
-            ...(anchorSegment
-              ? {
-                  planningStartDate: anchorSegment.date,
-                  manualInsertionAnchor: {
-                    date: anchorSegment.date,
-                    start: anchorSegment.start,
-                  },
-                }
-              : {
-                  planningStartDate: moment().format("YYYY-MM-DD"),
-                }),
-          }
-        : {
-            planningStartDate: planningAfterSafeDays,
-            preserveWorkingDaysFromToday: 0,
-            includeTodayHoles: true,
-            freezeCurrentWeekSegments: false,
-            preserveTodaySegments: false,
-          }),
-    });
+    if (nextPaused) {
+      await applyRebalanceForDevelopers([ticket.assignee_id], {
+        preserveWorkingDaysFromToday: 0,
+        preserveExistingSequence: true,
+        includeTodayHoles: true,
+        freezeCurrentWeekSegments: false,
+        preserveTodaySegments: false,
+        allowInProgressReplan: true,
+        forceLastTicketIds: [ticket.id],
+        ...(anchorSegment
+          ? {
+              planningStartDate: anchorSegment.date,
+              manualInsertionAnchor: {
+                date: anchorSegment.date,
+                start: anchorSegment.start,
+              },
+            }
+          : {
+              planningStartDate: moment().format("YYYY-MM-DD"),
+            }),
+      });
+    } else {
+      const reactivationDeveloper = resolveTicketAssigneeDeveloper(ticket);
+      if (reactivationDeveloper) {
+        await schedulePriorityInsertionBeforeNew({
+          developer: reactivationDeveloper,
+          ticketId: ticket.id,
+          insertBeforeNextActivity: true,
+        });
+        await queryClient.invalidateQueries({ queryKey: ["ticket", ticketId] });
+        await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+      } else {
+        const nowInfo = getNowInRome();
+        await applyRebalanceForDevelopers([ticket.assignee_id], {
+          preserveWorkingDaysFromToday: 0,
+          preserveExistingSequence: false,
+          includeTodayHoles: true,
+          freezeCurrentWeekSegments: false,
+          preserveTodaySegments: false,
+          preserveElapsedTodaySegments: true,
+          allowInProgressReplan: true,
+          forceFirstTicketIds: [ticket.id],
+          planningStartDate: nowInfo.date,
+          manualInsertionAnchor: {
+            date: nowInfo.date,
+            start: nowInfo.roundedDecimal ?? DAY_START,
+          },
+        });
+      }
+    }
 
     toast({
       title: nextPaused ? "Ticket sospeso per mancanza dati" : "Ticket riattivato",
       description: nextPaused
         ? "Priorita portata a 0 e team cliente notificato."
-        : "La priorita del ticket e stata ricalcolata dopo i giorni protetti.",
+        : "Il ticket e stato reinserito in pipeline spostando le attivita successive.",
     });
   };
 

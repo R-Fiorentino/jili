@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { LayoutGrid, List, Users, Ticket, Clock, Search, CheckCircle2, Zap } from "lucide-react";
 import {
+  calculatePriorityScore,
   compareTicketsByPriority,
   getEffectivePriorityScore,
   getTicketWorkflowStatus,
@@ -279,6 +280,37 @@ export default function Dashboard() {
 
   const handleStatusChange = async (ticketId, newStatus, ticket) => {
     const previousStatus = normalizeTicketStatus(ticket.status);
+    const isReactivatingFromBlocked =
+      previousStatus === "blocked" &&
+      newStatus !== "blocked" &&
+      !isClosedStatus(newStatus);
+    const clearMissingDataOnReactivation =
+      isReactivatingFromBlocked && ticket?.missing_required_data === true;
+    const ticketClient = clearMissingDataOnReactivation
+      ? clients.find(
+          (client) =>
+            client.id === ticket.client_id ||
+            String(client.name || "").toLowerCase() === String(ticket.client_name || "").toLowerCase()
+        )
+      : null;
+    const reactivationData = clearMissingDataOnReactivation
+      ? {
+          missing_required_data: false,
+          missing_required_data_reported_at: null,
+          missing_required_data_reported_by: null,
+          missing_required_data_reported_by_id: null,
+          priority_override: null,
+          priority_score: calculatePriorityScore(
+            {
+              ...ticket,
+              status: newStatus,
+              missing_required_data: false,
+              priority_override: null,
+            },
+            ticketClient
+          ),
+        }
+      : {};
     const auditEntry = {
       timestamp: new Date().toISOString(),
       user: "system",
@@ -287,7 +319,7 @@ export default function Dashboard() {
     };
 
     const isCompletion = isClosedStatus(newStatus);
-    const nowInRome = isCompletion ? getNowInRome() : null;
+    const nowInRome = isCompletion || isReactivatingFromBlocked ? getNowInRome() : null;
     const doneSnapshot = isCompletion
       ? buildDoneScheduleSnapshot(ticket, nowInRome?.date, nowInRome?.roundedTime || nowInRome?.time)
       : null;
@@ -309,7 +341,7 @@ export default function Dashboard() {
 
     await appClient.entities.Ticket.update(ticketId, {
       status: newStatus,
-      ...(newStatus === "blocked"
+      ...(newStatus === "blocked" || isReactivatingFromBlocked
         ? {
             scheduled_date: null,
             start_time: null,
@@ -317,6 +349,7 @@ export default function Dashboard() {
             continuation_schedule: [],
           }
         : {}),
+      ...reactivationData,
       ...(doneSnapshot || doneFallback),
       audit_log: [...(ticket.audit_log || []), auditEntry],
     });
@@ -331,6 +364,22 @@ export default function Dashboard() {
             freezeCurrentWeekSegments: false,
             preserveTodaySegments: false,
           })
+        : isReactivatingFromBlocked
+          ? getDynamicRebalanceOptions({
+              preserveWorkingDaysFromToday: 0,
+              preserveExistingSequence: false,
+              includeTodayHoles: true,
+              freezeCurrentWeekSegments: false,
+              preserveTodaySegments: false,
+              preserveElapsedTodaySegments: true,
+              allowInProgressReplan: true,
+              forceFirstTicketIds: [ticketId],
+              planningStartDate: nowInRome?.date || moment().format("YYYY-MM-DD"),
+              manualInsertionAnchor: {
+                date: nowInRome?.date || moment().format("YYYY-MM-DD"),
+                start: nowInRome?.roundedDecimal ?? 9,
+              },
+            })
         : getDynamicRebalanceOptions();
       const updates = buildWeeklyRebalanceUpdates(
         latestTickets,

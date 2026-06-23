@@ -1017,6 +1017,40 @@ function getTimesheetSegmentsForTicket(ticket) {
     : getAllTicketSegments(ticket);
 }
 
+function getInProgressReminderInfo(ticket, nowDecimal = currentTimeDecimal()) {
+  if (normalizeTicketStatus(ticket?.status) !== "in_progress") return null;
+
+  const segments = sortSegments(getAllTicketSegments(ticket));
+  const lastSegment = segments[segments.length - 1] || null;
+  if (!lastSegment) return null;
+
+  const todayStr = moment().format("YYYY-MM-DD");
+  const lastDate = String(lastSegment.date || "");
+  const plannedEndLabel = `${lastDate} ${decimalToTime(lastSegment.end)}`;
+
+  if (lastDate < todayStr) {
+    return {
+      kind: "previous_day",
+      title: "Task ancora in corso dal giorno precedente",
+      description: `Era pianificata fino a ${plannedEndLabel}. Verifica se va chiusa.`,
+      plannedEndLabel,
+      canExtend: false,
+    };
+  }
+
+  if (lastDate === todayStr && Number(lastSegment.end) <= Number(nowDecimal)) {
+    return {
+      kind: "timer_elapsed",
+      title: "Timer pianificato terminato",
+      description: `La task era pianificata fino alle ${decimalToTime(lastSegment.end)}.`,
+      plannedEndLabel,
+      canExtend: lastSegment.end < DAY_END,
+    };
+  }
+
+  return null;
+}
+
 /**
  * Build time-based schedule for tickets within visible week.
  * Returns: { [dateStr]: [{ ticket, startHour, endHour }] }
@@ -1378,6 +1412,7 @@ export function buildWeeklyRebalanceUpdates(
     allowInProgressReplan = false,
     manualInsertionAnchor = null,
     preserveExistingSequence = false,
+    forceFirstTicketIds = [],
     forceLastTicketIds = [],
   } = {}
 ) {
@@ -1401,6 +1436,7 @@ export function buildWeeklyRebalanceUpdates(
   const preserveAllBeforePlanningStart = planningStartMoment.isAfter(todayMoment, "day");
   const protectedWorkingDates = getProtectedWorkingDateSet(todayMoment, preserveWorkingDaysFromToday);
   const frozenTicketSet = new Set((freezeTicketIds || []).filter(Boolean));
+  const forceFirstTicketSet = new Set((forceFirstTicketIds || []).filter(Boolean));
   const forceLastTicketSet = new Set((forceLastTicketIds || []).filter(Boolean));
 
   const devTickets = (allTickets || []).filter(
@@ -1557,6 +1593,10 @@ export function buildWeeklyRebalanceUpdates(
   }
 
   const sortedTickets = [...replannable].sort((a, b) => {
+    const aForcedFirst = forceFirstTicketSet.has(a.id);
+    const bForcedFirst = forceFirstTicketSet.has(b.id);
+    if (aForcedFirst !== bForcedFirst) return aForcedFirst ? -1 : 1;
+
     if (preserveExistingSequence) {
       const aForcedLast = forceLastTicketSet.has(a.id);
       const bForcedLast = forceLastTicketSet.has(b.id);
@@ -1798,6 +1838,8 @@ export default function DevPipeline() {
   const [activeDeveloperId, setActiveDeveloperId] = usePersistedState("dev-pipeline:activeDeveloperId", "");
   const [pendingRequestedDeveloperId, setPendingRequestedDeveloperId] = useState(() => searchParams.get("dev") || "");
   const [selectedClientIds, setSelectedClientIds] = usePersistedState("dev-pipeline:selectedClientIds", null);
+  const [dismissedInProgressReminderIds, setDismissedInProgressReminderIds] = useState([]);
+  const [showInProgressReminderList, setShowInProgressReminderList] = useState(false);
   const staleRebalanceSignatureRef = useRef("");
   const queryClient = useQueryClient();
   const { user, isTechSupervisor, isAdmin, isAnalyst } = useCurrentUser();
@@ -2072,6 +2114,23 @@ export default function DevPipeline() {
     [activeDevs, activeDeveloperId]
   );
   const visibleDevelopers = activeDeveloper ? [activeDeveloper] : [];
+  const visibleDeveloperIds = useMemo(
+    () => new Set(visibleDevelopers.map((developer) => developer.id).filter(Boolean)),
+    [visibleDevelopers]
+  );
+  const inProgressReminders = useMemo(() => {
+    if (visibleDeveloperIds.size === 0) return [];
+    const dismissedIds = new Set(dismissedInProgressReminderIds);
+
+    return tickets
+      .filter((ticket) => visibleDeveloperIds.has(ticket.assignee_id))
+      .map((ticket) => ({
+        ticket,
+        info: getInProgressReminderInfo(ticket, currentTime),
+      }))
+      .filter((entry) => entry.info && !dismissedIds.has(entry.ticket.id))
+      .sort((a, b) => String(a.info.plannedEndLabel).localeCompare(String(b.info.plannedEndLabel)));
+  }, [currentTime, dismissedInProgressReminderIds, tickets, visibleDeveloperIds]);
   const canDownloadTimesheet =
     Boolean(activeDeveloper) &&
     (isAdmin || (loggedDeveloper && activeDeveloper?.id === loggedDeveloper.id));
@@ -2084,6 +2143,141 @@ export default function DevPipeline() {
       return selectedClientIdSet.has(getTicketClientKey(ticket));
     });
   }, [tickets, selectedClientIdSet, clientsById, clientsByName]);
+
+  const dismissInProgressReminder = (ticketId) => {
+    if (!ticketId) return;
+    setDismissedInProgressReminderIds((current) =>
+      current.includes(ticketId) ? current : [...current, ticketId]
+    );
+  };
+
+  const rebalanceAfterReminderAction = async (ticket, options = {}) => {
+    if (!ticket?.assignee_id) return;
+
+    const latestTickets = await appClient.entities.Ticket.list();
+    const dev = developers.find((developer) => developer.id === ticket.assignee_id) || null;
+    const updates = buildWeeklyRebalanceUpdates(
+      latestTickets,
+      ticket.assignee_id,
+      dev,
+      getDynamicRebalanceOptions(options)
+    );
+
+    if (updates.length > 0) {
+      await Promise.all(
+        updates.map((entry) => appClient.entities.Ticket.update(entry.id, entry.updates))
+      );
+    }
+  };
+
+  const handleCompleteInProgressReminder = async (ticket) => {
+    if (!ticket?.id) return;
+
+    const nowDecimal = roundHalf(Math.min(DAY_END, Math.max(DAY_START, currentTimeDecimal())));
+    const nowTime = decimalToTime(nowDecimal);
+    const todayStr = moment().format("YYYY-MM-DD");
+    const segments = sortSegments(getAllTicketSegments(ticket));
+    const lastSegment = segments[segments.length - 1] || null;
+    const nextSegments = lastSegment?.date === todayStr && nowDecimal > lastSegment.start
+      ? segments.map((segment, index) =>
+          index === segments.length - 1
+            ? { ...segment, end: Math.max(segment.end, nowDecimal) }
+            : segment
+        )
+      : segments;
+    const scheduleUpdates = schedulePayloadFromSegments(nextSegments);
+    const auditEntry = {
+      timestamp: new Date().toISOString(),
+      user: user?.email || user?.full_name || "user",
+      action: "status_change",
+      details: `Status: in_progress → done (reminder, end: ${nowTime})`,
+    };
+
+    await appClient.entities.Ticket.update(ticket.id, {
+      status: "done",
+      ...(nextSegments.length > 0 ? scheduleUpdates : {}),
+      audit_log: [...(ticket.audit_log || []), auditEntry],
+    });
+
+    await rebalanceAfterReminderAction(ticket, {
+      preserveWorkingDaysFromToday: 0,
+      preserveExistingSequence: true,
+      includeTodayHoles: true,
+      freezeCurrentWeekSegments: false,
+      preserveTodaySegments: false,
+      planningStartDate: todayStr,
+      manualInsertionAnchor: {
+        date: todayStr,
+        start: nowDecimal,
+      },
+    });
+    dismissInProgressReminder(ticket.id);
+    await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+    toast({
+      title: "Task chiusa",
+      description: `${ticket.title} segnata come done.`,
+    });
+  };
+
+  const handleExtendInProgressReminder = async (ticket) => {
+    if (!ticket?.id) return;
+
+    const todayStr = moment().format("YYYY-MM-DD");
+    const segments = sortSegments(getAllTicketSegments(ticket));
+    const targetIndex = segments.findLastIndex((segment) => String(segment.date || "") === todayStr);
+    if (targetIndex < 0) {
+      toast({
+        variant: "destructive",
+        title: "Estensione non disponibile",
+        description: "Per task rimaste da giorni precedenti apri il ticket e verifica manualmente.",
+      });
+      return;
+    }
+
+    const targetSegment = segments[targetIndex];
+    const nextEnd = roundHalf(Math.min(DAY_END, Math.max(targetSegment.end + 0.5, ceilHalf(currentTimeDecimal()))));
+    if (nextEnd <= targetSegment.end) {
+      toast({
+        variant: "destructive",
+        title: "Nessuno spazio utile",
+        description: "La task e gia arrivata al termine della giornata lavorativa.",
+      });
+      return;
+    }
+
+    const nextSegments = segments.map((segment, index) =>
+      index === targetIndex ? { ...segment, end: nextEnd } : segment
+    );
+    const scheduleUpdates = schedulePayloadFromSegments(nextSegments);
+    const auditEntry = {
+      timestamp: new Date().toISOString(),
+      user: user?.email || user?.full_name || "user",
+      action: "schedule_extended",
+      details: `Task in progress estesa di 30 minuti fino alle ${decimalToTime(nextEnd)}`,
+    };
+
+    await appClient.entities.Ticket.update(ticket.id, {
+      ...scheduleUpdates,
+      audit_log: [...(ticket.audit_log || []), auditEntry],
+    });
+
+    await rebalanceAfterReminderAction(ticket, {
+      freezeTicketIds: [ticket.id],
+      preserveWorkingDaysFromToday: 0,
+      preserveExistingSequence: true,
+      planningStartDate: todayStr,
+      manualInsertionAnchor: {
+        date: todayStr,
+        start: nextEnd,
+      },
+    });
+    dismissInProgressReminder(ticket.id);
+    await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+    toast({
+      title: "Task estesa",
+      description: `${ticket.title} estesa fino alle ${decimalToTime(nextEnd)}.`,
+    });
+  };
 
   const toggleClientFilter = (clientId) => {
     setSelectedClientIds((prev) => {
@@ -2351,6 +2545,120 @@ export default function DevPipeline() {
           </div>
         </div>
       </Card>
+
+      {inProgressReminders.length > 0 && (
+        <Card className="shrink-0 border-amber-200 bg-amber-50/85 p-2.5 shadow-[var(--shadow-soft)] dark:border-amber-500/30 dark:bg-amber-500/10">
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div className="flex min-w-0 items-center gap-2.5">
+              <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-amber-200/80 text-amber-800 dark:bg-amber-500/20 dark:text-amber-200">
+                <AlertTriangle className="h-4 w-4" />
+              </span>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-amber-800 dark:text-amber-300">
+                    Reminder operativo
+                  </p>
+                  <span className="rounded-full border border-amber-200 bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800 dark:border-amber-500/35 dark:bg-amber-500/15 dark:text-amber-200">
+                    {inProgressReminders.length}
+                  </span>
+                </div>
+                <p className="truncate text-sm font-medium text-amber-950 dark:text-amber-100">
+                  {inProgressReminders.length === 1
+                    ? "C'e una task in corso da verificare."
+                    : `Ci sono ${inProgressReminders.length} task in corso da verificare.`}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex shrink-0 flex-wrap items-center gap-2 md:justify-end">
+              {inProgressReminders[0] && (
+                <Button asChild variant="outline" size="sm" className="h-7 rounded-full px-3 text-xs">
+                  <Link to={buildTicketDetailUrl(inProgressReminders[0].ticket.id, activeDeveloperId)}>
+                    Apri prima
+                  </Link>
+                </Button>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 rounded-full px-3 text-xs"
+                onClick={() => setShowInProgressReminderList((current) => !current)}
+              >
+                {showInProgressReminderList ? "Nascondi" : "Mostra"}
+              </Button>
+            </div>
+          </div>
+
+          {showInProgressReminderList && (
+          <div className="mt-2 space-y-2 overflow-y-auto pr-1" style={{ maxHeight: "min(32vh, 260px)" }}>
+            {inProgressReminders.map(({ ticket, info }) => {
+              const { clientColor, clientName } = getTicketClientMeta(ticket);
+              const assignee = developers.find((developer) => developer.id === ticket.assignee_id);
+
+              return (
+                <div
+                  key={ticket.id}
+                  className="flex flex-col gap-2 rounded-xl border border-amber-200/80 bg-card/95 p-2.5 shadow-[var(--shadow-soft)] lg:flex-row lg:items-center lg:justify-between dark:border-amber-500/25"
+                  style={{ borderLeftWidth: 4, borderLeftColor: clientColor }}
+                >
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-full border border-amber-200 bg-amber-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800 dark:border-amber-500/35 dark:bg-amber-500/15 dark:text-amber-200">
+                        {info.kind === "previous_day" ? "Da ieri" : "Timer scaduto"}
+                      </span>
+                      <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+                        <Clock className="h-3 w-3" />
+                        {info.plannedEndLabel}
+                      </span>
+                    </div>
+                    <p className="mt-1 truncate text-sm font-semibold text-foreground">{ticket.title}</p>
+                    <p className="mt-0.5 truncate text-xs text-muted-foreground">{info.description}</p>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                      <span className="inline-flex items-center gap-1 font-medium">
+                        <span className="h-2 w-2 rounded-full" style={{ backgroundColor: clientColor }} />
+                        {clientName}
+                      </span>
+                      {assignee?.name && <span>{assignee.name}</span>}
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 lg:justify-end">
+                    <Button asChild variant="outline" size="sm" className="h-8 rounded-full px-3 text-xs">
+                      <Link to={buildTicketDetailUrl(ticket.id, activeDeveloperId)}>Apri</Link>
+                    </Button>
+                    {info.canExtend && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-8 rounded-full px-3 text-xs"
+                        onClick={() => handleExtendInProgressReminder(ticket)}
+                      >
+                        +30 min
+                      </Button>
+                    )}
+                    <Button
+                      size="sm"
+                      className="h-8 rounded-full px-3 text-xs"
+                      onClick={() => handleCompleteInProgressReminder(ticket)}
+                    >
+                      Segna done
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 rounded-full px-3 text-xs text-muted-foreground"
+                      onClick={() => dismissInProgressReminder(ticket.id)}
+                    >
+                      Ignora
+                    </Button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          )}
+        </Card>
+      )}
 
       {/* Mobile agenda */}
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1 lg:hidden">
