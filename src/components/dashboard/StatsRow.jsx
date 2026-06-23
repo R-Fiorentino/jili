@@ -1,24 +1,28 @@
 import React from "react";
 import { Card } from "@/components/ui/card";
 import { Ticket, Clock, Users, CheckCircle2, Search, Zap } from "lucide-react";
-import { getEffectivePriorityScore, isClosedStatus, normalizeTicketStatus } from "../shared/priorityUtils";
+import {
+  getEffectivePriorityScore,
+  getTicketWorkflowStatus,
+  isSchedulableTicket,
+  isTicketClosed,
+} from "../shared/priorityUtils";
 
 export default function StatsRow({ tickets, developers, showPriorityScore = true }) {
-  const openTickets = tickets.filter((t) => !isClosedStatus(t.status)).length;
-  const inProgress = tickets.filter((t) => normalizeTicketStatus(t.status) === "in_progress").length;
-  const qaReview = tickets.filter((t) => normalizeTicketStatus(t.status) === "qa_review").length;
+  const openTickets = tickets.filter((t) => !isTicketClosed(t)).length;
+  const inProgress = tickets.filter((t) => getTicketWorkflowStatus(t) === "in_progress").length;
+  const qaReview = tickets.filter((t) => getTicketWorkflowStatus(t) === "qa_review").length;
   const doneThisWeek = tickets.filter(t => {
-    if (!isClosedStatus(t.status)) return false;
+    if (!isTicketClosed(t)) return false;
     const updated = new Date(t.updated_date);
     const weekAgo = new Date();
     weekAgo.setDate(weekAgo.getDate() - 7);
     return updated >= weekAgo;
   }).length;
-  const avgScore = openTickets > 0
+  const schedulableTickets = tickets.filter((t) => isSchedulableTicket(t));
+  const avgScore = schedulableTickets.length > 0
     ? Math.round(
-        tickets
-          .filter((t) => !isClosedStatus(t.status))
-          .reduce((s, t) => s + getEffectivePriorityScore(t), 0) / openTickets
+        schedulableTickets.reduce((s, t) => s + getEffectivePriorityScore(t), 0) / schedulableTickets.length
       )
     : 0;
 

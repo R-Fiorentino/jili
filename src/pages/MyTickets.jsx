@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo } from "react";
 import { appClient } from "@/api/appClient";
 import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent } from "@/components/ui/card";
@@ -14,16 +14,91 @@ import {
   DIFFICULTY_CONFIG,
   getActualEffortHours,
   getPlannedEffortHours,
-  isClosedStatus,
   getTicketWorkflowStatus,
+  isTicketClosed,
   compareTicketsByPriority,
 } from "../components/shared/priorityUtils";
 import { useCurrentUser } from "../components/shared/useCurrentUser";
+import usePersistedState from "../components/shared/usePersistedState";
 import BacklogTable from "../components/dashboard/BacklogTable";
 import moment from "moment";
 
 function normalizeText(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+function normalizeId(value) {
+  return String(value || "").trim();
+}
+
+function collectTeamIds(client, fieldNames = []) {
+  return fieldNames.flatMap((fieldName) => {
+    const values = client?.[fieldName];
+    if (!Array.isArray(values)) return [];
+
+    return values
+      .map((entry) => {
+        if (entry && typeof entry === "object") {
+          return normalizeId(entry.id || entry.user_id || entry.uid || entry.email);
+        }
+        return normalizeId(entry);
+      })
+      .filter(Boolean);
+  });
+}
+
+function collectTeamNames(client, fieldNames = []) {
+  return fieldNames.flatMap((fieldName) => {
+    const values = client?.[fieldName];
+    if (!Array.isArray(values)) return [];
+
+    return values
+      .flatMap((entry) => {
+        if (entry && typeof entry === "object") {
+          return [
+            entry.full_name,
+            entry.name,
+            entry.email,
+          ];
+        }
+        return [entry];
+      })
+      .map(normalizeText)
+      .filter(Boolean);
+  });
+}
+
+function analystBelongsToClient(client, user) {
+  const userIds = [
+    user?.id,
+    user?.uid,
+    user?.user_id,
+    user?.firebase_uid,
+  ].map(normalizeId).filter(Boolean);
+  const userNames = [
+    user?.email,
+    user?.full_name,
+    user?.name,
+  ].map(normalizeText).filter(Boolean);
+
+  const analystIds = collectTeamIds(client, [
+    "analyst_team_ids",
+    "analyst_ids",
+    "analysts_ids",
+    "analysts",
+    "analyst_team",
+  ]);
+  const analystNames = collectTeamNames(client, [
+    "analyst_team_names",
+    "analyst_names",
+    "analysts",
+    "analyst_team",
+  ]);
+
+  return (
+    userIds.some((id) => analystIds.includes(id)) ||
+    userNames.some((name) => analystNames.includes(name))
+  );
 }
 
 function normalizeTicketKind(ticket) {
@@ -41,7 +116,7 @@ function sortByPriorityThenRecent(a, b) {
 
 export default function MyTickets() {
   const { user, loading: userLoading, isTechSupervisor: isTechSupervisorRole } = useCurrentUser();
-  const [showOnlyMine, setShowOnlyMine] = useState(true);
+  const [showOnlyMine, setShowOnlyMine] = usePersistedState("my-tickets:showOnlyMine", true);
 
   const { data: tickets = [], isLoading } = useQuery({
     queryKey: ["tickets"],
@@ -61,7 +136,7 @@ export default function MyTickets() {
     enabled: !!user?.email,
   });
 
-  const normalizedRole = normalizeAppRole(user?.role);
+  const normalizedRole = normalizeAppRole(user?.app_role || user?._app_role || user?.role);
   const isDeveloper = normalizedRole === "developer";
   const isTechSupervisor = isTechSupervisorRole || normalizedRole === "tech_supervisor";
   const loggedDeveloperProfile = useMemo(
@@ -76,7 +151,7 @@ export default function MyTickets() {
       .filter((entry) => {
         if (normalizedRole !== "analyst") return true;
         const kind = normalizeTicketKind(entry);
-        return kind !== "qa_review" && kind !== "qa_fix" && kind !== "live_ops";
+        return kind !== "qa_review" && kind !== "qa_fix" && kind !== "live_ops" && kind !== "post_preview_change";
       })
       .sort(sortByPriorityThenRecent);
     if (!showOnlyMine) return base;
@@ -85,14 +160,7 @@ export default function MyTickets() {
     const myClientNames = new Set();
 
     clients.forEach((client) => {
-      const inAnalystTeam = (client.analyst_team_ids || []).includes(user?.id);
-      const inAnalystNameTeam = (client.analyst_team_names || []).some((name) => {
-        const normalizedName = normalizeText(name);
-        return normalizedName && (
-          normalizedName === normalizeText(user?.full_name) ||
-          normalizedName === normalizeText(user?.email)
-        );
-      });
+      const inAnalystTeam = analystBelongsToClient(client, user);
       const loggedDeveloperId = String(loggedDeveloperProfile?.id || "").trim();
       const isClientSupervisorById =
         isTechSupervisor &&
@@ -117,23 +185,30 @@ export default function MyTickets() {
 
       if (
         inAnalystTeam ||
-        inAnalystNameTeam ||
         isClientSupervisorById ||
         isClientSupervisorByName ||
         isClientSupervisorByEmail
       ) {
-        myClientIds.add(client.id);
+        myClientIds.add(normalizeId(client.id));
         myClientNames.add(normalizeText(client.name));
       }
     });
 
     return base.filter((ticket) => {
-      const byCreator = normalizeText(ticket.created_by) === normalizeText(user?.email);
-      const byClientId = ticket.client_id && myClientIds.has(ticket.client_id);
+      const byCreator = [ticket.created_by, ticket.created_by_email, ticket.created_by_name]
+        .map(normalizeText)
+        .some((creator) =>
+          creator &&
+          (
+            creator === normalizeText(user?.email) ||
+            creator === normalizeText(user?.full_name)
+          )
+        );
+      const byClientId = ticket.client_id && myClientIds.has(normalizeId(ticket.client_id));
       const byClientName = myClientNames.has(normalizeText(ticket.client_name));
       return Boolean(byCreator || byClientId || byClientName);
     });
-  }, [isDeveloper, isTechSupervisor, tickets, showOnlyMine, clients, loggedDeveloperProfile?.id, user?.id, user?.full_name, user?.email]);
+  }, [isDeveloper, isTechSupervisor, normalizedRole, tickets, showOnlyMine, clients, loggedDeveloperProfile?.id, user]);
   const analystSummary = useMemo(() => {
     return scopedTickets.reduce(
       (acc, ticket) => {
@@ -160,8 +235,8 @@ export default function MyTickets() {
     const myTickets = tickets.filter(
       (ticket) => normalizeText(ticket.assignee_email) === normalizeText(user?.email)
     );
-    const active = myTickets.filter((ticket) => !isClosedStatus(ticket.status));
-    const done = myTickets.filter((ticket) => isClosedStatus(ticket.status));
+    const active = myTickets.filter((ticket) => !isTicketClosed(ticket));
+    const done = myTickets.filter((ticket) => isTicketClosed(ticket));
     const myDeveloper = loggedDeveloperProfile;
     const slotManagerUrl = `${createPageUrl("Availability")}${myDeveloper?.id ? `?dev_id=${encodeURIComponent(myDeveloper.id)}` : ""}`;
 
@@ -179,7 +254,7 @@ export default function MyTickets() {
                 <div className="mb-1 flex flex-wrap items-center gap-2">
                   <Badge className={`${status.color} text-xs`}>{status.label}</Badge>
                   <Badge variant="outline" className={`${diff.color} border-0 text-xs`}>{diff.label}</Badge>
-                  {!plannedEffort && !isClosedStatus(ticket.status) && (
+                  {!plannedEffort && !isTicketClosed(ticket) && (
                     <Badge variant="outline" className="border-amber-200 bg-amber-50 text-xs text-amber-700 dark:border-amber-500/35 dark:bg-amber-500/15 dark:text-amber-300">
                       Effort previsto mancante
                     </Badge>
@@ -189,12 +264,12 @@ export default function MyTickets() {
                 <p className="mt-0.5 text-xs text-muted-foreground">{ticket.client_name} · {moment(ticket.created_date).fromNow()}</p>
               </div>
               <div className="flex shrink-0 items-center gap-3 text-sm text-muted-foreground">
-                {isClosedStatus(ticket.status) && actualEffort > 0 && (
+                {isTicketClosed(ticket) && actualEffort > 0 && (
                   <span className="flex items-center gap-1">
                     <Clock className="h-3.5 w-3.5" />{actualEffort}h
                   </span>
                 )}
-                {!isClosedStatus(ticket.status) && plannedEffort > 0 && (
+                {!isTicketClosed(ticket) && plannedEffort > 0 && (
                   <span className="flex items-center gap-1 text-amber-600">
                     <Clock className="h-3.5 w-3.5" />~{plannedEffort}h
                   </span>
@@ -300,6 +375,7 @@ export default function MyTickets() {
           fillHeight
           showTypeColumn={false}
           showPlanningStartColumn
+          showDifficultyFilter={false}
           defaultSortField="planning_start"
           defaultSortDir={1}
           detailFromPage="my_tickets"

@@ -44,11 +44,13 @@ async function listUsersByEmails(emails = []) {
 }
 
 async function listUsersByIds(ids = []) {
-  const normalized = Array.from(new Set((ids || []).filter(Boolean)));
+  const normalized = Array.from(
+    new Set((ids || []).map((id) => String(id || "").trim()).filter(Boolean))
+  );
   if (normalized.length === 0) return [];
 
   const allUsers = await appClient.entities.User.list();
-  return allUsers.filter((user) => normalized.includes(user.id));
+  return allUsers.filter((user) => normalized.includes(String(user.id || "").trim()));
 }
 
 async function resolveActor(actor) {
@@ -143,6 +145,57 @@ function dedupeRecipients(users = []) {
   return [...recipients.values()];
 }
 
+export function normalizeTicketWatchers(ticketOrWatchers = []) {
+  const rawWatchers = Array.isArray(ticketOrWatchers)
+    ? ticketOrWatchers
+    : Array.isArray(ticketOrWatchers?.watchers)
+      ? ticketOrWatchers.watchers
+      : [];
+  const byKey = new Map();
+
+  rawWatchers.forEach((watcher) => {
+    const isObject = watcher && typeof watcher === "object";
+    const id = String(
+      isObject
+        ? watcher.id || watcher.user_id || watcher.recipient_id || ""
+        : ""
+    ).trim();
+    const rawEmail = isObject
+      ? watcher.email || watcher.user_email || watcher.recipient_email || ""
+      : isEmailLike(watcher)
+        ? watcher
+        : "";
+    const email = normalizeEmail(rawEmail);
+    const name = String(
+      isObject
+        ? watcher.name || watcher.full_name || watcher.user_name || watcher.email || watcher.user_email || ""
+        : watcher || ""
+    ).trim();
+    const key = id || email || normalizeName(name);
+    if (!key) return;
+
+    const previous = byKey.get(key) || {};
+    byKey.set(key, {
+      id: previous.id || id,
+      email: previous.email || email,
+      name: previous.name || name || email || id,
+      added_at: previous.added_at || (isObject ? watcher.added_at || "" : ""),
+      added_by: previous.added_by || (isObject ? watcher.added_by || "" : ""),
+    });
+  });
+
+  return [...byKey.values()];
+}
+
+async function resolveTicketWatcherUsers(ticket) {
+  const watchers = normalizeTicketWatchers(ticket);
+  if (watchers.length === 0) return [];
+
+  const usersById = await listUsersByIds(watchers.map((watcher) => watcher.id));
+  const usersByEmail = await listUsersByEmails(watchers.map((watcher) => watcher.email));
+  return dedupeRecipients([...usersById, ...usersByEmail]);
+}
+
 export async function createNotification({
   recipientId,
   recipientEmail = "",
@@ -179,9 +232,12 @@ export async function createNotification({
 }
 
 export async function notifyTicketAssigned({ ticket, actor }) {
-  if (!ticket?.id || !ticket?.assignee_email) return;
+  if (!ticket?.id) return;
 
-  const users = await listUsersByEmails([ticket.assignee_email]);
+  const users = dedupeRecipients([
+    ...(await listUsersByEmails([ticket.assignee_email])),
+    ...(await resolveTicketWatcherUsers(ticket)),
+  ]);
   if (users.length === 0) return;
 
   await Promise.all(
@@ -210,16 +266,23 @@ export async function notifyTicketComment({
   if (!ticket?.id) return;
 
   const clientSupervisorUsers = await resolveClientTechSupervisorUsers(client);
+  const watcherUsers = await resolveTicketWatcherUsers(ticket);
   const recipientEmails = [
     ticket.assignee_email,
     ticket.created_by,
     ...extractEmailsFromComments(ticket?.comments || []),
     ...(extraRecipientEmails || []),
     ...clientSupervisorUsers.map((user) => user.email),
+    ...watcherUsers.map((user) => user.email),
   ]
     .map(normalizeEmail)
     .filter(Boolean);
-  const recipientIds = Array.from(new Set((extraRecipientIds || []).filter(Boolean)));
+  const recipientIds = Array.from(
+    new Set([
+      ...(extraRecipientIds || []).filter(Boolean),
+      ...watcherUsers.map((user) => user.id).filter(Boolean),
+    ])
+  );
   if (recipientEmails.length === 0 && recipientIds.length === 0) return;
 
   const usersByEmail = await listUsersByEmails(Array.from(new Set(recipientEmails)));
@@ -262,9 +325,12 @@ export async function notifyClientTicketUpdate({
   metadata = {},
   type = "ticket_client_update",
 }) {
-  if (!ticket?.id || !client || !title) return;
+  if (!ticket?.id || !title) return;
 
-  const recipients = await resolveClientTechSupervisorUsers(client);
+  const recipients = dedupeRecipients([
+    ...(client ? await resolveClientTechSupervisorUsers(client) : []),
+    ...(await resolveTicketWatcherUsers(ticket)),
+  ]);
   if (recipients.length === 0) return;
 
   await Promise.all(
@@ -278,7 +344,7 @@ export async function notifyClientTicketUpdate({
         body,
         ticket,
         metadata: {
-          client_id: client.id || null,
+          client_id: client?.id || null,
           ...metadata,
         },
       })
@@ -287,9 +353,12 @@ export async function notifyClientTicketUpdate({
 }
 
 export async function notifyTicketDone({ ticket, actor }) {
-  if (!ticket?.id || !ticket?.created_by) return;
+  if (!ticket?.id) return;
 
-  const users = await listUsersByEmails([ticket.created_by]);
+  const users = dedupeRecipients([
+    ...(await listUsersByEmails([ticket.created_by])),
+    ...(await resolveTicketWatcherUsers(ticket)),
+  ]);
   if (users.length === 0) return;
 
   await Promise.all(
@@ -308,30 +377,31 @@ export async function notifyTicketDone({ ticket, actor }) {
 }
 
 export async function notifyTicketMissingData({ ticket, actor, client }) {
-  if (!ticket?.id || !client) return;
+  if (!ticket?.id) return;
 
   const developers = await appClient.entities.Developer.list();
   const recipientEmails = new Set();
   const recipientIds = new Set();
 
-  const supervisor = developers.find((dev) => dev.id === client.tech_supervisor_id);
+  const supervisor = client ? developers.find((dev) => dev.id === client.tech_supervisor_id) : null;
   if (supervisor?.email) recipientEmails.add(supervisor.email);
 
   developers
-    .filter((dev) => (client.operations_ids || []).includes(dev.id))
+    .filter((dev) => (client?.operations_ids || []).includes(dev.id))
     .forEach((dev) => {
       if (dev?.email) recipientEmails.add(dev.email);
     });
 
-  (client.analyst_team_ids || []).forEach((id) => {
+  (client?.analyst_team_ids || []).forEach((id) => {
     if (id) recipientIds.add(id);
   });
 
   const usersByEmail = await listUsersByEmails([...recipientEmails]);
   const usersById = await listUsersByIds([...recipientIds]);
+  const watcherUsers = await resolveTicketWatcherUsers(ticket);
   const recipients = new Map();
 
-  [...usersByEmail, ...usersById].forEach((recipient) => {
+  [...usersByEmail, ...usersById, ...watcherUsers].forEach((recipient) => {
     if (!recipient?.id) return;
     recipients.set(recipient.id, recipient);
   });
@@ -346,10 +416,10 @@ export async function notifyTicketMissingData({ ticket, actor, client }) {
         actor,
         type: "ticket_missing_data",
         title: "Ticket fermo: mancano dati",
-        body: `${ticket.title} · ${client.name || ticket.client_name || "Cliente"}`,
+        body: `${ticket.title} · ${client?.name || ticket.client_name || "Cliente"}`,
         ticket,
         metadata: {
-          client_id: client.id || null,
+          client_id: client?.id || null,
           reason: "missing_required_data",
         },
       })
@@ -363,6 +433,7 @@ export async function notifyQaReviewApproved({ ticket, actor, client }) {
   const recipients = dedupeRecipients([
     ...(await resolveClientAnalystUsers(client)),
     ...(await resolveAdminUsers()),
+    ...(await resolveTicketWatcherUsers(ticket)),
   ]);
   if (recipients.length === 0) return;
 
@@ -397,6 +468,7 @@ export async function notifyQaReviewRejected({
   const recipients = dedupeRecipients([
     ...devUsers,
     ...(await resolveClientAnalystUsers(client)),
+    ...(await resolveTicketWatcherUsers(ticket)),
   ]);
   if (recipients.length === 0) return;
 
@@ -438,6 +510,7 @@ export async function notifyLiveOpsCompleted({
   const recipients = dedupeRecipients([
     ...(await resolveClientAnalystUsers(client)),
     ...(await resolveAdminUsers()),
+    ...(await resolveTicketWatcherUsers(ticket)),
   ]);
   if (recipients.length === 0) return;
 
@@ -455,6 +528,33 @@ export async function notifyLiveOpsCompleted({
           client_id: client.id || null,
           reason: "live_ops_completed",
           live_operation_type: normalizedType,
+        },
+      })
+    )
+  );
+}
+
+export async function notifyWatcherAdded({ ticket, actor, watcher }) {
+  if (!ticket?.id || !watcher) return;
+
+  const recipients = dedupeRecipients([
+    ...(await listUsersByIds([watcher.id || watcher.user_id])),
+    ...(await listUsersByEmails([watcher.email || watcher.user_email])),
+  ]);
+  if (recipients.length === 0) return;
+
+  await Promise.all(
+    recipients.map((recipient) =>
+      createNotification({
+        recipientId: recipient.id,
+        recipientEmail: recipient.email,
+        actor,
+        type: "ticket_watcher_added",
+        title: "Sei watcher di un ticket",
+        body: `${ticket.title}`,
+        ticket,
+        metadata: {
+          reason: "watcher_added",
         },
       })
     )

@@ -16,7 +16,7 @@ import {
   calculatePriorityScore,
   DEFAULT_CONFIG,
   getPlannedEffortHours,
-  isOpenStatus,
+  isSchedulableTicket,
 } from "../components/shared/priorityUtils";
 import {
   buildWeeklyRebalanceUpdates,
@@ -24,6 +24,7 @@ import {
   getDynamicRebalanceOptions,
 } from "./DevPipeline";
 import { useCurrentUser } from "../components/shared/useCurrentUser";
+import ClientSelect from "../components/shared/ClientSelect";
 import { notifyClientTicketUpdate, notifyTicketAssigned } from "@/lib/notificationService";
 import { buildReferenceLinksPayload, normalizeReferenceLinks } from "../components/shared/ticketReferenceLinks";
 
@@ -102,7 +103,7 @@ export default function CreateTicket() {
     });
 
     ticketList
-      .filter((ticket) => ticket.assignee_id && isOpenStatus(ticket.status))
+      .filter((ticket) => isSchedulableTicket(ticket))
       .forEach((ticket) => {
         if (devLoad[ticket.assignee_id] !== undefined) {
           devLoad[ticket.assignee_id] += getPlannedEffortHours(ticket);
@@ -129,10 +130,6 @@ export default function CreateTicket() {
   const roleHomePage = getHomePageForRole(normalizeAppRole(user?.app_role || user?._app_role || user?.role));
   const isTechSupervisor = hasTechSupervisorCapability(user);
   const homePageUrl = createPageUrl(roleHomePage);
-  const sortedClients = useMemo(
-    () => [...clients].sort((a, b) => String(a?.name || "").localeCompare(String(b?.name || ""), "it")),
-    [clients]
-  );
   const plannedEffort = Number(form.proposed_effort);
   const hasValidPlannedEffort = Number.isFinite(plannedEffort) && plannedEffort > 0;
   const normalizedReferenceLinks = normalizeReferenceLinks(form.reference_links);
@@ -394,16 +391,12 @@ export default function CreateTicket() {
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
               <div className="space-y-1.5 xl:col-span-2">
                 <Label className="text-xs font-semibold text-gray-600">Cliente *</Label>
-                <Select value={form.client_id} onValueChange={handleClientChange}>
-                  <SelectTrigger className="h-10"><SelectValue placeholder="Seleziona cliente" /></SelectTrigger>
-                  <SelectContent>
-                    {sortedClients.map((c) => (
-                      <SelectItem key={c.id} value={c.id}>
-                        {c.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <ClientSelect
+                  clients={clients}
+                  value={form.client_id}
+                  onValueChange={handleClientChange}
+                  placeholder="Seleziona cliente"
+                />
               </div>
 
               <div className="space-y-1.5">

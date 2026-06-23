@@ -11,7 +11,8 @@ import {
   getEffectivePriorityScore,
   getPlannedEffortHours,
   isPriorityPaused,
-  isClosedStatus,
+  isTicketClosed,
+  isTicketBlocked,
 } from "./priorityUtils";
 import { Link } from "react-router-dom";
 import { createTicketDetailUrl } from "@/utils";
@@ -26,6 +27,8 @@ export default function TicketCard({ ticket, isDragging, showPriorityScore = tru
   const plannedEffort = getPlannedEffortHours(ticket);
   const actualEffort = getActualEffortHours(ticket);
   const priorityPaused = isPriorityPaused(ticket);
+  const ticketBlocked = isTicketBlocked(ticket);
+  const ticketClosed = isTicketClosed(ticket);
 
   return (
     <Link to={createTicketDetailUrl(ticket.id, detailFromPage)}>
@@ -44,8 +47,8 @@ export default function TicketCard({ ticket, isDragging, showPriorityScore = tru
             </Badge>
           </div>
           <div
-            className={`mt-1 h-2.5 w-2.5 shrink-0 rounded-full ${priorityPaused ? "bg-amber-500" : priority.color}`}
-            title={priorityPaused ? "Mancano dati per procedere" : `Priority: ${priority.label}`}
+            className={`mt-1 h-2.5 w-2.5 shrink-0 rounded-full ${ticketBlocked ? "bg-amber-500" : priority.color}`}
+            title={ticketBlocked ? "Ticket in pausa" : `Priority: ${priority.label}`}
           />
         </div>
 
@@ -56,9 +59,9 @@ export default function TicketCard({ ticket, isDragging, showPriorityScore = tru
         {ticket.client_name && (
           <div className="mb-3 flex flex-wrap items-center gap-1.5">
             <p className="text-xs font-medium text-muted-foreground">{ticket.client_name}</p>
-            {priorityPaused && (
+            {ticketBlocked && (
               <Badge variant="outline" className="border-0 bg-amber-100/80 px-2 py-0.5 text-[10px] font-semibold text-amber-700 dark:bg-amber-500/15 dark:text-amber-300">
-                Mancano dati
+                {priorityPaused ? "Mancano dati" : "In pausa"}
               </Badge>
             )}
           </div>
@@ -66,7 +69,7 @@ export default function TicketCard({ ticket, isDragging, showPriorityScore = tru
 
         <div className="flex items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-2.5 text-[11px] text-muted-foreground">
-            {isClosedStatus(ticket.status) && actualEffort ? (
+            {ticketClosed && actualEffort ? (
               <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100/80 px-2 py-0.5 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">
                 <Clock className="h-3 w-3" /> {actualEffort}h
               </span>

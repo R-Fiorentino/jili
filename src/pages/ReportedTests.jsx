@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo } from "react";
 import { appClient } from "@/api/appClient";
 import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent } from "@/components/ui/card";
@@ -19,7 +19,14 @@ import {
   Line,
 } from "recharts";
 import moment from "moment";
-import { DEFAULT_CONFIG, getIndustryOptions, normalizeTicketStatus } from "../components/shared/priorityUtils";
+import ClientSelect from "../components/shared/ClientSelect";
+import usePersistedState from "../components/shared/usePersistedState";
+import {
+  DEFAULT_CONFIG,
+  getIndustryOptions,
+  getTicketReportedOutcome,
+  getTicketWorkflowStatus,
+} from "../components/shared/priorityUtils";
 
 const OUTCOME_META = {
   winner: {
@@ -92,10 +99,10 @@ function SummaryCard({ title, value, description, icon: Icon, tone = "default" }
 }
 
 export default function ReportedTests() {
-  const [selectedIndustry, setSelectedIndustry] = useState("all");
-  const [selectedClientId, setSelectedClientId] = useState("all");
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
+  const [selectedIndustry, setSelectedIndustry] = usePersistedState("reported-tests:industry", "all");
+  const [selectedClientId, setSelectedClientId] = usePersistedState("reported-tests:client", "all");
+  const [dateFrom, setDateFrom] = usePersistedState("reported-tests:dateFrom", "");
+  const [dateTo, setDateTo] = usePersistedState("reported-tests:dateTo", "");
 
   const { data: tickets = [], isLoading } = useQuery({
     queryKey: ["tickets"],
@@ -117,11 +124,11 @@ export default function ReportedTests() {
 
   const reportedRows = useMemo(() => {
     return tickets
-      .filter((ticket) => normalizeTicketStatus(ticket.status) === "reported")
+      .filter((ticket) => getTicketWorkflowStatus(ticket) === "reported")
       .map((ticket) => {
         const client = clients.find((entry) => entry.id === ticket.client_id) || null;
         const goLiveDate = normalizeDate(ticket.reported_at || ticket.updated_date);
-        const outcome = String(ticket.reported_outcome || "").trim();
+        const outcome = getTicketReportedOutcome(ticket);
 
         return {
           id: ticket.id,
@@ -243,19 +250,15 @@ export default function ReportedTests() {
               </SelectContent>
             </Select>
 
-            <Select value={selectedClientId} onValueChange={setSelectedClientId}>
-              <SelectTrigger className="bg-background">
-                <SelectValue placeholder="Client" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">Tutti i clienti</SelectItem>
-                {availableClients.map((client) => (
-                  <SelectItem key={client.id} value={client.id}>
-                    {client.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <ClientSelect
+              clients={availableClients}
+              value={selectedClientId}
+              onValueChange={setSelectedClientId}
+              placeholder="Client"
+              allValue="all"
+              allLabel="Tutti i clienti"
+              triggerClassName="bg-background"
+            />
 
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
               <input

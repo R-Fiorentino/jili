@@ -17,6 +17,7 @@ import {
   showBrowserNotification,
 } from "@/lib/browserNotifications";
 import { useToast } from "@/components/ui/use-toast";
+import usePersistedState from "../components/shared/usePersistedState";
 import moment from "moment";
 
 const TYPE_META = {
@@ -25,6 +26,7 @@ const TYPE_META = {
   ticket_done: { label: "Completato", icon: TicketCheck, badge: "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300" },
   ticket_missing_data: { label: "Mancano dati", icon: AlertTriangle, badge: "bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300" },
   ticket_client_update: { label: "Aggiornamento cliente", icon: Bell, badge: "bg-indigo-50 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300" },
+  ticket_watcher_added: { label: "Watcher", icon: Bell, badge: "bg-sky-50 text-sky-700 dark:bg-sky-500/15 dark:text-sky-300" },
   live_ops_completed: { label: "Live ops", icon: TicketCheck, badge: "bg-teal-50 text-teal-700 dark:bg-teal-500/15 dark:text-teal-300" },
   generic: { label: "Notifica", icon: Bell, badge: "bg-gray-50 text-gray-700 dark:bg-slate-500/15 dark:text-slate-200" },
 };
@@ -37,6 +39,7 @@ const NOTIFICATION_FILTERS = [
   { key: "live_ops_completed", label: "Live ops", types: ["live_ops_completed"] },
   { key: "ticket_missing_data", label: "Mancano dati", types: ["ticket_missing_data"] },
   { key: "ticket_client_update", label: "Aggiornamenti cliente", types: ["ticket_client_update"] },
+  { key: "ticket_watcher_added", label: "Watcher", types: ["ticket_watcher_added"] },
 ];
 
 function getNotificationDate(notification) {
@@ -53,7 +56,7 @@ export default function Notifications() {
   const { user, loading } = useCurrentUser();
   const queryClient = useQueryClient();
   const { toast } = useToast();
-  const [activeFilter, setActiveFilter] = useState("all");
+  const [activeFilter, setActiveFilter] = usePersistedState("notifications:activeFilter", "all");
   const [browserPermission, setBrowserPermission] = useState(getBrowserNotificationPermission());
   const [browserNotificationsEnabled, setBrowserNotificationsEnabledState] = useState(
     areBrowserNotificationsEnabled(user?.id)

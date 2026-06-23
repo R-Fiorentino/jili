@@ -19,6 +19,35 @@ export const DEFAULT_CONFIG = {
 };
 
 export const DEFAULT_INDUSTRY_OPTIONS = [...DEFAULT_CONFIG.industry_options];
+export const REPORT_OUTCOME_VALUES = ["winner", "loser", "not_significant"];
+
+const REPORT_OUTCOME_ALIASES = {
+  win: "winner",
+  winner: "winner",
+  lose: "loser",
+  loser: "loser",
+  lost: "loser",
+  not_significant: "not_significant",
+  notsignificant: "not_significant",
+  "not significant": "not_significant",
+};
+
+export function normalizeReportOutcome(value) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+  if (!normalized) return "";
+  return REPORT_OUTCOME_ALIASES[normalized] || "";
+}
+
+export function getTicketReportedOutcome(ticket) {
+  return (
+    normalizeReportOutcome(ticket?.reported_outcome) ||
+    normalizeReportOutcome(ticket?.test_report?.outcome)
+  );
+}
+
+export function hasTicketReportedOutcome(ticket) {
+  return Boolean(getTicketReportedOutcome(ticket));
+}
 
 export function getIndustryOptions(config) {
   const options = Array.isArray(config?.industry_options)
@@ -123,8 +152,16 @@ export function isPriorityPaused(ticket) {
   return ticket?.missing_required_data === true;
 }
 
+export function isBlockedStatus(status) {
+  return normalizeTicketStatus(status) === "blocked";
+}
+
+export function isTicketBlocked(ticket) {
+  return isBlockedStatus(ticket?.status) || isPriorityPaused(ticket);
+}
+
 export function calculatePriorityScore(ticket, client, config = DEFAULT_CONFIG) {
-  if (isPriorityPaused(ticket)) return 0;
+  if (isTicketBlocked(ticket)) return 0;
   if (!client) return 0;
 
   const safeConfig = {
@@ -167,7 +204,7 @@ export function calculatePriorityScore(ticket, client, config = DEFAULT_CONFIG) 
 
 export function getEffectivePriorityScore(ticket) {
   if (!ticket) return 0;
-  if (isPriorityPaused(ticket)) return 0;
+  if (isTicketBlocked(ticket)) return 0;
   const rawOverride = ticket.priority_override;
   const hasOverride =
     rawOverride !== null &&
@@ -255,13 +292,17 @@ export const STATUS_CONFIG = {
     color: "bg-indigo-100 text-indigo-700 border-indigo-200 dark:bg-indigo-500/15 dark:text-indigo-300 dark:border-indigo-500/35",
     icon: "file",
   },
+  blocked: {
+    label: "In pausa",
+    color: "bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-500/15 dark:text-amber-300 dark:border-amber-500/35",
+    icon: "pause",
+  },
 };
 
-export const PIPELINE_ORDER = ["new", "in_progress", "qa_review", "done"];
+export const PIPELINE_ORDER = ["new", "in_progress", "qa_review", "done", "blocked"];
 const LEGACY_STATUS_MAP = {
   needs_effort: "new",
   ready: "new",
-  blocked: "in_progress",
 };
 
 export function normalizeTicketStatus(status) {
@@ -274,7 +315,7 @@ export function normalizeTicketStatus(status) {
 export function getTicketWorkflowStatus(ticket) {
   const normalized = normalizeTicketStatus(ticket?.status);
   if (normalized === "reported") return "reported";
-  return hasTicketReportContent(ticket) ? "reported" : normalized;
+  return hasTicketReportedOutcome(ticket) || hasTicketReportContent(ticket) ? "reported" : normalized;
 }
 
 export function isClosedStatus(status) {
@@ -282,8 +323,16 @@ export function isClosedStatus(status) {
   return normalized === "done" || normalized === "qa_review" || normalized === "reported";
 }
 
+export function isTicketClosed(ticket) {
+  return isClosedStatus(getTicketWorkflowStatus(ticket));
+}
+
 export function isOpenStatus(status) {
   return !isClosedStatus(status);
+}
+
+export function isSchedulableTicket(ticket) {
+  return Boolean(ticket?.assignee_id) && !isTicketClosed(ticket) && !isTicketBlocked(ticket);
 }
 
 export const DIFFICULTY_CONFIG = {
@@ -307,7 +356,7 @@ export function suggestAssignment(developers, tickets) {
   developers.forEach(d => { devLoad[d.id] = 0; });
   
   tickets
-    .filter((t) => t.assignee_id && isOpenStatus(t.status))
+    .filter((t) => isSchedulableTicket(t))
     .forEach(t => {
       if (devLoad[t.assignee_id] !== undefined) {
         devLoad[t.assignee_id] += getPlannedEffortHours(t);

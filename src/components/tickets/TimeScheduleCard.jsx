@@ -10,8 +10,8 @@ import {
   getActualEffortHours,
   getEffectivePriorityScore,
   getPlannedEffortHours,
-  isClosedStatus,
-  normalizeTicketStatus,
+  getTicketWorkflowStatus,
+  isTicketClosed,
 } from "../shared/priorityUtils";
 
 const DAY_START = 9;
@@ -272,8 +272,8 @@ export default function TimeScheduleCard({ ticket, canEdit, onUpdate }) {
       })()
     : null;
 
-  const normalizedStatus = normalizeTicketStatus(ticket.status);
-  const isDone = isClosedStatus(normalizedStatus);
+  const normalizedStatus = getTicketWorkflowStatus(ticket);
+  const isDone = isTicketClosed(ticket);
   const isInProgress = normalizedStatus === "in_progress";
   const displayScheduleRows = getDisplayScheduleRows(ticket, { isDone });
   const firstDisplayRow = displayScheduleRows[0] || null;

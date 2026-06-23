@@ -9,7 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { ArrowLeft, Clock, ExternalLink, Plus, Send, Loader2, AlertTriangle, Trash2, Pencil, X } from "lucide-react";
+import { ArrowLeft, Bell, Clock, ExternalLink, Plus, Send, Loader2, AlertTriangle, Trash2, Pencil, X } from "lucide-react";
 import { Link, useLocation } from "react-router-dom";
 import { createPageUrl, getHomePageForRole, normalizeAppRole } from "@/utils";
 import { toast } from "@/components/ui/use-toast";
@@ -27,6 +27,9 @@ import {
   getTicketWorkflowStatus,
   isPriorityPaused,
   isClosedStatus,
+  isSchedulableTicket,
+  isTicketBlocked,
+  isTicketClosed,
   normalizeTicketStatus,
 } from "../components/shared/priorityUtils";
 import {
@@ -39,6 +42,7 @@ import { useCurrentUser } from "../components/shared/useCurrentUser";
 import TimeScheduleCard from "../components/tickets/TimeScheduleCard";
 import { buildReferenceLinksPayload, getReferenceLinkLabel, normalizeReferenceLinks } from "../components/shared/ticketReferenceLinks";
 import {
+  normalizeTicketWatchers,
   notifyClientTicketUpdate,
   notifyLiveOpsCompleted,
   notifyQaReviewApproved,
@@ -47,6 +51,7 @@ import {
   notifyTicketComment,
   notifyTicketDone,
   notifyTicketMissingData,
+  notifyWatcherAdded,
 } from "@/lib/notificationService";
 import moment from "moment";
 import ReactMarkdown from "react-markdown";
@@ -63,6 +68,8 @@ const REPORT_OUTCOME_OPTIONS = [
 const QA_REVIEW_EFFORT_HOURS = 0.5;
 const QA_FIX_EFFORT_HOURS = 0.5;
 const QA_SYSTEM_PRIORITY = 180;
+const POST_PREVIEW_CHANGE_EFFORT_HOURS = 0.5;
+const POST_PREVIEW_SYSTEM_PRIORITY = 190;
 const LIVE_OPS_EFFORT_HOURS = 0.5;
 const LIVE_SYSTEM_PRIORITY = 170;
 const LIVE_OPERATION_LABELS = {
@@ -224,8 +231,39 @@ function normalizeText(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function buildWatcherFromUser(sourceUser = {}) {
+  return {
+    id: String(sourceUser?.id || "").trim(),
+    email: String(sourceUser?.email || "").trim(),
+    name: String(sourceUser?.full_name || sourceUser?.name || sourceUser?.email || "").trim(),
+    added_at: new Date().toISOString(),
+  };
+}
+
+function getWatcherKey(watcher = {}) {
+  return (
+    String(watcher?.id || "").trim() ||
+    String(watcher?.email || "").trim().toLowerCase() ||
+    String(watcher?.name || "").trim().toLowerCase()
+  );
+}
+
+function watcherMatchesUser(watcher = {}, sourceUser = {}) {
+  const watcherId = String(watcher?.id || "").trim();
+  const watcherEmail = String(watcher?.email || "").trim().toLowerCase();
+  const userId = String(sourceUser?.id || "").trim();
+  const userEmail = String(sourceUser?.email || "").trim().toLowerCase();
+  return Boolean((watcherId && watcherId === userId) || (watcherEmail && watcherEmail === userEmail));
+}
+
 function ceilHalf(value) {
   return Math.ceil((Number(value) || 0) * 2) / 2;
+}
+
+function normalizeEffortHours(value) {
+  const parsed = Number(String(value || "").replace(",", "."));
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.max(0.5, roundHalf(parsed));
 }
 
 function timeToDecimal(timeStr) {
@@ -615,7 +653,7 @@ function buildQaPhaseEvents(mainTicket, allTickets = []) {
     .filter((entry) => String(entry?.parent_ticket_id || "").trim() === String(mainTicket.id))
     .filter((entry) => {
       const kind = normalizeTicketKind(entry);
-      return kind === "qa_review" || kind === "qa_fix";
+      return kind === "qa_review" || kind === "qa_fix" || kind === "post_preview_change";
     });
 
   const events = [];
@@ -682,6 +720,31 @@ function buildQaPhaseEvents(mainTicket, allTickets = []) {
           timestamp: getEventTimestamp(completionAudit?.timestamp, entry.updated_date),
           title: "Bug fix completato",
           description: "Fix completato e rimandato in review.",
+          actor: completionAudit?.user || entry.assignee_name || "Developer",
+          cycle,
+          tone: "success",
+        });
+      }
+    }
+
+    if (kind === "post_preview_change") {
+      events.push({
+        id: `${entry.id}-created`,
+        timestamp: getEventTimestamp(entry.post_preview_requested_at, entry.created_date, entry.updated_date),
+        title: "Modifica post-preview richiesta",
+        description: entry.post_preview_notes || entry.description || "Creata una task collegata per il developer assegnato.",
+        actor: entry.post_preview_requested_by || entry.created_by || "Analyst",
+        cycle,
+        tone: "warning",
+      });
+
+      if (isClosedStatus(entry.status)) {
+        const completionAudit = getAuditEntryByAction(entry, "post_preview_change_completed");
+        events.push({
+          id: `${entry.id}-completed`,
+          timestamp: getEventTimestamp(completionAudit?.timestamp, entry.updated_date),
+          title: "Modifica post-preview completata",
+          description: "La task collegata e stata completata dal developer.",
           actor: completionAudit?.user || entry.assignee_name || "Developer",
           cycle,
           tone: "success",
@@ -790,12 +853,20 @@ export default function TicketDetail() {
     target: "",
     notes: "",
     outcome: "",
+    effort_hours: String(LIVE_OPS_EFFORT_HOURS),
+    assignee_id: "",
   });
   const [submittingLiveOps, setSubmittingLiveOps] = useState(false);
   const [submittingQaRequest, setSubmittingQaRequest] = useState(false);
   const [qaRejectDialog, setQaRejectDialog] = useState(false);
   const [qaRejectNotes, setQaRejectNotes] = useState("");
   const [submittingQaDecision, setSubmittingQaDecision] = useState(false);
+  const [postPreviewDialog, setPostPreviewDialog] = useState(false);
+  const [postPreviewNotes, setPostPreviewNotes] = useState("");
+  const [postPreviewEffortInput, setPostPreviewEffortInput] = useState(String(POST_PREVIEW_CHANGE_EFFORT_HOURS));
+  const [postPreviewAssigneeId, setPostPreviewAssigneeId] = useState("");
+  const [submittingPostPreviewChange, setSubmittingPostPreviewChange] = useState(false);
+  const [watcherToAddId, setWatcherToAddId] = useState("");
   const { user, isAnalyst, isDeveloper, isAdmin, isTechSupervisor } = useCurrentUser();
 
   useEffect(() => {
@@ -881,6 +952,7 @@ export default function TicketDetail() {
   const isQaReviewTicket = ticketKind === "qa_review";
   const isQaFixTicket = ticketKind === "qa_fix";
   const isLiveOpsTicket = ticketKind === "live_ops";
+  const isPostPreviewChangeTicket = ticketKind === "post_preview_change";
   const mainTicketRecord = useMemo(() => {
     if (!ticket) return null;
     if (ticketKind === "main") return ticket;
@@ -902,7 +974,8 @@ export default function TicketDetail() {
     (mainTicketRecord && mainTicketRecord.id !== ticket?.id) ||
     (isQaReviewTicket && qaSourceTicketRecord && qaSourceTicketRecord.id !== mainTicketRecord?.id) ||
     isQaFixTicket ||
-    isQaReviewTicket
+    isQaReviewTicket ||
+    isPostPreviewChangeTicket
   );
   const qaPhaseEvents = useMemo(() => {
     if (ticketKind !== "main" || !ticket) return [];
@@ -1083,16 +1156,34 @@ export default function TicketDetail() {
     );
   };
 
+  const resolveActiveDeveloperById = (developerId) =>
+    developers.find(
+      (developer) => developer.id === developerId && developer.active !== false
+    ) || null;
+
+  const resolveTicketAssigneeDeveloper = (sourceTicket) =>
+    resolveActiveDeveloperById(sourceTicket?.assignee_id) ||
+    developers.find(
+      (developer) =>
+        developer.active !== false &&
+        normalizeText(developer?.email) === normalizeText(sourceTicket?.assignee_email)
+    ) ||
+    null;
+
   const resolveQaCycle = (sourceTicket = null, parentTicket = null) => {
     return Math.max(getQaCycleValue(sourceTicket), getQaCycleValue(parentTicket), 1);
   };
 
-  const schedulePriorityInsertionBeforeNew = async ({ developer, ticketId: targetTicketId }) => {
+  const schedulePriorityInsertionBeforeNew = async ({
+    developer,
+    ticketId: targetTicketId,
+    insertBeforeNextActivity = false,
+  }) => {
     if (!developer?.id || !targetTicketId) return null;
 
     const latestTickets = await appClient.entities.Ticket.list();
     const sourceDeveloperTickets = latestTickets.filter(
-      (entry) => entry.assignee_id === developer.id && !isClosedStatus(entry.status)
+      (entry) => entry.assignee_id === developer.id && isSchedulableTicket(entry)
     );
     const nowInfo = getNowInRome();
     const currentOccupiedTicket = sourceDeveloperTickets.find((entry) => {
@@ -1115,14 +1206,30 @@ export default function TicketDetail() {
         ) || null
       : null;
 
+    const manualAnchorStart = currentOccupiedSegment
+      ? currentOccupiedSegment.end
+      : (nowInfo.roundedDecimal ?? ceilHalf(nowInfo.decimal));
+    const manualInsertionAnchor =
+      insertBeforeNextActivity && Number.isFinite(manualAnchorStart)
+        ? {
+            date: currentOccupiedSegment?.date || nowInfo.date,
+            start: manualAnchorStart,
+          }
+        : currentOccupiedSegment
+          ? {
+              date: currentOccupiedSegment.date,
+              start: currentOccupiedSegment.end,
+            }
+          : null;
+
     const freezeTicketIds = sourceDeveloperTickets
       .filter(
-        (entry) =>
-          entry.id !== targetTicketId &&
-          (
-            normalizeTicketStatus(entry.status) !== "new" ||
-            entry.id === currentOccupiedTicket?.id
-          )
+        (entry) => {
+          if (entry.id === targetTicketId) return false;
+          if (entry.id === currentOccupiedTicket?.id) return true;
+          if (insertBeforeNextActivity) return false;
+          return normalizeTicketStatus(entry.status) !== "new";
+        }
       )
       .map((entry) => entry.id);
 
@@ -1133,14 +1240,19 @@ export default function TicketDetail() {
       {
         ...getDynamicRebalanceOptions({
           preserveWorkingDaysFromToday: 0,
+          preserveExistingSequence: false,
+          ...(insertBeforeNextActivity
+            ? {
+                includeTodayHoles: true,
+                freezeCurrentWeekSegments: false,
+                preserveTodaySegments: false,
+                preserveElapsedTodaySegments: true,
+                allowInProgressReplan: true,
+              }
+            : {}),
         }),
-        planningStartDate: currentOccupiedSegment?.date || nowInfo.date,
-        manualInsertionAnchor: currentOccupiedSegment
-          ? {
-              date: currentOccupiedSegment.date,
-              start: currentOccupiedSegment.end,
-            }
-          : null,
+        planningStartDate: manualInsertionAnchor?.date || nowInfo.date,
+        manualInsertionAnchor,
         freezeTicketIds,
       }
     );
@@ -1174,7 +1286,7 @@ export default function TicketDetail() {
   });
 
   const getCompletionConflictData = (newStatus) => {
-    if (!isClosedStatus(newStatus) || isClosedStatus(ticket?.status)) return null;
+    if (!isClosedStatus(newStatus) || isTicketClosed(ticket)) return null;
 
     const nowInfo = getNowInRome();
     const planned = getPlannedCompletionInfo(ticket);
@@ -1259,6 +1371,10 @@ export default function TicketDetail() {
       qa_requested_at: new Date().toISOString(),
       qa_requested_by: user?.email || user?.full_name || "user",
       qa_requested_by_id: user?.id || null,
+      watchers: normalizeTicketWatchers([
+        ...normalizeTicketWatchers(parentTicket),
+        ...normalizeTicketWatchers(sourceTicket),
+      ]),
       audit_log: [
         buildAuditEntry("qa_review_created", `QA review creata per ${supervisor.name}`),
       ],
@@ -1324,6 +1440,10 @@ export default function TicketDetail() {
       qa_review_notes: sourceTicket.qa_review_notes || parentTicket.qa_review_notes || "",
       qa_test_instructions: sourceTicket.qa_test_instructions || parentTicket.qa_test_instructions || "",
       qa_reject_notes: rejectNotes,
+      watchers: normalizeTicketWatchers([
+        ...normalizeTicketWatchers(parentTicket),
+        ...normalizeTicketWatchers(sourceTicket),
+      ]),
       audit_log: [
         buildAuditEntry("qa_fix_created", `QA fix creato per ${sourceDeveloper.name}`),
       ],
@@ -1343,6 +1463,93 @@ export default function TicketDetail() {
     }).catch(() => {});
 
     return createdFixTicket;
+  };
+
+  const createPostPreviewChangeChildTicket = async ({
+    parentTicket,
+    changeNotes,
+    effortHours,
+    assignedDeveloperId,
+  }) => {
+    const targetDeveloper =
+      resolveActiveDeveloperById(assignedDeveloperId) ||
+      resolveTicketAssigneeDeveloper(parentTicket);
+    if (!targetDeveloper) {
+      throw new Error("Developer non trovato per creare la modifica post-preview.");
+    }
+    const normalizedEffort = normalizeEffortHours(effortHours);
+    if (!normalizedEffort) {
+      throw new Error("Effort non valido per creare la modifica post-preview.");
+    }
+
+    const latestTickets = await appClient.entities.Ticket.list();
+    const existingChange = latestTickets.find(
+      (entry) =>
+        normalizeTicketKind(entry) === "post_preview_change" &&
+        entry.parent_ticket_id === parentTicket.id &&
+        !isClosedStatus(entry.status)
+    );
+    if (existingChange) {
+      throw new Error("Esiste gia una modifica post-preview aperta per questo ticket.");
+    }
+
+    const referencePayload = buildReferenceLinksPayload(
+      normalizeReferenceLinks(parentTicket.reference_links, parentTicket.link)
+    );
+    const nowIso = new Date().toISOString();
+
+    const createdChangeTicket = await appClient.entities.Ticket.create({
+      title: `[Modifica post-preview] ${parentTicket.title}`,
+      description: changeNotes,
+      required_tracking: parentTicket.required_tracking || "",
+      ...referencePayload,
+      client_id: parentTicket.client_id,
+      client_name: parentTicket.client_name,
+      type: "bug_fix",
+      difficulty: parentTicket.difficulty || "medium",
+      status: "new",
+      assignee_id: targetDeveloper.id,
+      assignee_name: targetDeveloper.name,
+      assignee_email: targetDeveloper.email,
+      proposed_effort: normalizedEffort,
+      priority_score: POST_PREVIEW_SYSTEM_PRIORITY,
+      priority_override: POST_PREVIEW_SYSTEM_PRIORITY,
+      ticket_kind: "post_preview_change",
+      parent_ticket_id: parentTicket.id,
+      qa_preview_url: parentTicket.qa_preview_url || "",
+      qa_review_notes: parentTicket.qa_review_notes || "",
+      qa_test_instructions: parentTicket.qa_test_instructions || "",
+      post_preview_notes: changeNotes,
+      post_preview_requested_at: nowIso,
+      post_preview_requested_by: user?.email || user?.full_name || "user",
+      post_preview_requested_by_id: user?.id || null,
+      watchers: normalizeTicketWatchers(parentTicket),
+      audit_log: [
+        buildAuditEntry(
+          "post_preview_change_created",
+          `Modifica post-preview creata per ${targetDeveloper.name} (${normalizedEffort}h)`
+        ),
+      ],
+    });
+
+    const scheduledChangeUpdates = await schedulePriorityInsertionBeforeNew({
+      developer: targetDeveloper,
+      ticketId: createdChangeTicket.id,
+      insertBeforeNextActivity: true,
+    });
+
+    await notifyTicketAssigned({
+      ticket: {
+        ...createdChangeTicket,
+        ...(scheduledChangeUpdates || {}),
+      },
+      actor: user,
+    }).catch(() => {});
+
+    return {
+      ...createdChangeTicket,
+      ...(scheduledChangeUpdates || {}),
+    };
   };
 
   const completeQaReviewTransition = async ({
@@ -1489,10 +1696,17 @@ export default function TicketDetail() {
     target,
     notes,
     outcome,
+    effortHours,
+    assignedDeveloperId,
   }) => {
-    const supervisor = resolveTechSupervisorDeveloper(client);
-    if (!supervisor) {
-      throw new Error("Nessun tech supervisor configurato sul cliente.");
+    const defaultSupervisor = resolveTechSupervisorDeveloper(client);
+    const targetDeveloper = resolveActiveDeveloperById(assignedDeveloperId) || defaultSupervisor;
+    if (!targetDeveloper) {
+      throw new Error("Nessun developer configurato per la richiesta live.");
+    }
+    const normalizedEffort = normalizeEffortHours(effortHours);
+    if (!normalizedEffort) {
+      throw new Error("Effort non valido per creare la richiesta live.");
     }
 
     const existing = await getOpenLiveOpsTicketByType({
@@ -1503,15 +1717,6 @@ export default function TicketDetail() {
       throw new Error(`Esiste gia una richiesta aperta di ${getLiveOperationLabel(operationType).toLowerCase()}.`);
     }
 
-    const latestTickets = await appClient.entities.Ticket.list();
-    const schedule = findOptimalSchedule(
-      latestTickets,
-      supervisor.id,
-      LIVE_OPS_EFFORT_HOURS,
-      supervisor.daily_capacity || 8,
-      supervisor
-    );
-    const schedulePayload = buildSchedulePayloadFromSlots(schedule);
     const referencePayload = buildReferenceLinksPayload(
       normalizeReferenceLinks(parentTicket.reference_links, parentTicket.link)
     );
@@ -1537,10 +1742,10 @@ export default function TicketDetail() {
       type: "other",
       difficulty: parentTicket.difficulty || "medium",
       status: "new",
-      assignee_id: supervisor.id,
-      assignee_name: supervisor.name,
-      assignee_email: supervisor.email,
-      proposed_effort: LIVE_OPS_EFFORT_HOURS,
+      assignee_id: targetDeveloper.id,
+      assignee_name: targetDeveloper.name,
+      assignee_email: targetDeveloper.email,
+      proposed_effort: normalizedEffort,
       priority_score: Math.max(LIVE_SYSTEM_PRIORITY, getEffectivePriorityScore(parentTicket)),
       priority_override: LIVE_SYSTEM_PRIORITY,
       ticket_kind: "live_ops",
@@ -1557,18 +1762,33 @@ export default function TicketDetail() {
       live_requested_by: user?.email || user?.full_name || "user",
       live_requested_by_id: user?.id || null,
       live_confirmation_status: initialConfirmationStatus,
+      watchers: normalizeTicketWatchers(parentTicket),
       audit_log: [
-        buildAuditEntry("live_ops_created", `Task ${operationLabel.toLowerCase()} creata per ${supervisor.name}`),
+        buildAuditEntry(
+          "live_ops_created",
+          `Task ${operationLabel.toLowerCase()} creata per ${targetDeveloper.name} (${normalizedEffort}h)`
+        ),
       ],
-      ...schedulePayload,
+    });
+
+    const scheduledLiveOpsUpdates = await schedulePriorityInsertionBeforeNew({
+      developer: targetDeveloper,
+      ticketId: liveOpsTicket.id,
+      insertBeforeNextActivity: true,
     });
 
     await notifyTicketAssigned({
-      ticket: liveOpsTicket,
+      ticket: {
+        ...liveOpsTicket,
+        ...(scheduledLiveOpsUpdates || {}),
+      },
       actor: user,
     }).catch(() => {});
 
-    return liveOpsTicket;
+    return {
+      ...liveOpsTicket,
+      ...(scheduledLiveOpsUpdates || {}),
+    };
   };
 
   const completeLiveOpsTransition = async ({ statusOptions = {} } = {}) => {
@@ -1659,6 +1879,39 @@ export default function TicketDetail() {
     });
   };
 
+  const completePostPreviewChangeTransition = async ({ statusOptions = {} } = {}) => {
+    if (!isPostPreviewChangeTicket) return;
+
+    await finalizeStatusChange("done", {
+      ...statusOptions,
+      auditAction: "post_preview_change_completed",
+      auditDetails: "Modifica post-preview completata",
+      suppressCompletionNotification: true,
+    });
+
+    if (!mainTicketRecord) return;
+
+    await updateTicketWithAudit(
+      mainTicketRecord.id,
+      {
+        post_preview_completed_at: new Date().toISOString(),
+        post_preview_completed_by: user?.email || user?.full_name || "user",
+      },
+      "post_preview_change_completed",
+      `Modifica post-preview completata da ${user?.full_name || user?.email || "developer"}`
+    );
+
+    await notifyClientSupervisor({
+      ticketOverride: mainTicketRecord,
+      title: "Modifica post-preview completata",
+      body: mainTicketRecord.title,
+      metadata: {
+        reason: "post_preview_change_completed",
+        child_ticket_id: ticket.id,
+      },
+    });
+  };
+
   const handleLiveOpsRequestSubmit = async () => {
     if (ticketKind !== "main") return;
 
@@ -1668,8 +1921,26 @@ export default function TicketDetail() {
     const target = isStopOperation ? "" : String(liveOpsForm.target || "").trim();
     const notes = String(liveOpsForm.notes || "").trim();
     const outcome = String(liveOpsForm.outcome || "").trim();
+    const normalizedEffort = normalizeEffortHours(liveOpsForm.effort_hours);
+    const selectedDeveloper = resolveActiveDeveloperById(liveOpsForm.assignee_id);
     const validOutcomes = new Set(REPORT_OUTCOME_OPTIONS.map((option) => option.value));
 
+    if (!normalizedEffort) {
+      toast({
+        variant: "destructive",
+        title: "Effort non valido",
+        description: "Inserisci un effort positivo prima di inviare la richiesta live.",
+      });
+      return;
+    }
+    if (!selectedDeveloper) {
+      toast({
+        variant: "destructive",
+        title: "Developer obbligatorio",
+        description: "Seleziona il developer assegnatario della task live.",
+      });
+      return;
+    }
     if (!isStopOperation && (!split || !target)) {
       toast({
         variant: "destructive",
@@ -1710,13 +1981,15 @@ export default function TicketDetail() {
 
     setSubmittingLiveOps(true);
     try {
-      await createLiveOpsChildTicket({
+      const liveOpsTicket = await createLiveOpsChildTicket({
         parentTicket: ticket,
         operationType,
         split,
         target,
         notes,
         outcome,
+        effortHours: normalizedEffort,
+        assignedDeveloperId: selectedDeveloper.id,
       });
 
       const requestedState = LIVE_OPERATION_REQUESTED_STATE[operationType] || "not_live";
@@ -1742,7 +2015,7 @@ export default function TicketDetail() {
           ...(isStopOperation ? { reported_outcome: outcome } : {}),
         },
         "live_ops_requested",
-        `${getLiveOperationLabel(operationType)} richiesta da ${user?.full_name || user?.email || "analyst"}`
+        `${getLiveOperationLabel(operationType)} richiesta da ${user?.full_name || user?.email || "analyst"} e assegnata a ${liveOpsTicket.assignee_name || "developer"} (${normalizedEffort}h)`
       );
 
       await queryClient.invalidateQueries({ queryKey: ["ticket", ticketId] });
@@ -1754,7 +2027,7 @@ export default function TicketDetail() {
       }
       toast({
         title: `${getLiveOperationLabel(operationType)} richiesta`,
-        description: "Task operativa creata nella pipeline del tech supervisor.",
+        description: `Task operativa creata nella pipeline di ${liveOpsTicket.assignee_name || "developer"}.`,
       });
     } catch (error) {
       toast({
@@ -1769,6 +2042,7 @@ export default function TicketDetail() {
 
   const openLiveOpsRequestDialog = (operationType) => {
     const normalizedType = normalizeLiveOperationType(operationType);
+    const defaultAssignee = resolveTechSupervisorDeveloper(client);
     setLiveOpsForm({
       operation_type: normalizedType,
       split:
@@ -1777,8 +2051,17 @@ export default function TicketDetail() {
         normalizedType === "stop" ? "" : String(ticket?.live_target || "").trim(),
       notes: String(ticket?.live_notes || "").trim(),
       outcome: String(ticket?.reported_outcome || "").trim(),
+      effort_hours: String(LIVE_OPS_EFFORT_HOURS),
+      assignee_id: defaultAssignee?.id || "",
     });
     setLiveOpsDialog(true);
+  };
+
+  const openPostPreviewChangeDialog = () => {
+    setPostPreviewNotes("");
+    setPostPreviewEffortInput(String(POST_PREVIEW_CHANGE_EFFORT_HOURS));
+    setPostPreviewAssigneeId(resolveTicketAssigneeDeveloper(ticket)?.id || "");
+    setPostPreviewDialog(true);
   };
 
   const handleAssign = async (devId) => {
@@ -2102,8 +2385,14 @@ export default function TicketDetail() {
         timeData.continuation_schedule = [];
       }
     }
+    if (newStatus === "blocked") {
+      timeData.scheduled_date = null;
+      timeData.start_time = null;
+      timeData.end_time = null;
+      timeData.continuation_schedule = [];
+    }
     const isCompletionStatus = isClosedStatus(newStatus);
-    const wasCompletionStatus = isClosedStatus(ticket.status);
+    const wasCompletionStatus = isTicketClosed(ticket);
 
     if (isCompletionStatus && !wasCompletionStatus) {
       const resolvedCompletionDate =
@@ -2250,7 +2539,7 @@ export default function TicketDetail() {
       }
     }
 
-    if (isClosedStatus(newStatus) && !isClosedStatus(ticket.status)) {
+    if (isClosedStatus(newStatus) && !isTicketClosed(ticket)) {
       const conflict = getCompletionConflictData(newStatus);
       if (conflict) {
         setDoneConflict(conflict);
@@ -2269,6 +2558,20 @@ export default function TicketDetail() {
       }
 
       await completeQaFixAndRestartReview();
+      return;
+    }
+
+    if (ticketKind === "post_preview_change" && newStatus === "done") {
+      const conflict = getCompletionConflictData("done");
+      if (conflict) {
+        setDoneConflict({
+          ...conflict,
+          postPreviewChangeComplete: true,
+        });
+        return;
+      }
+
+      await completePostPreviewChangeTransition();
       return;
     }
 
@@ -2488,6 +2791,96 @@ export default function TicketDetail() {
       });
     } finally {
       setSubmittingQaDecision(false);
+    }
+  };
+
+  const handlePostPreviewChangeSubmit = async () => {
+    if (ticketKind !== "main") return;
+
+    const normalizedNotes = String(postPreviewNotes || "").trim();
+    if (!normalizedNotes) {
+      toast({
+        variant: "destructive",
+        title: "Indicazioni obbligatorie",
+        description: "Inserisci cosa va modificato prima di creare la task.",
+      });
+      return;
+    }
+
+    const normalizedEffort = normalizeEffortHours(postPreviewEffortInput);
+    const selectedDeveloper = resolveActiveDeveloperById(postPreviewAssigneeId);
+    if (!normalizedEffort) {
+      toast({
+        variant: "destructive",
+        title: "Effort non valido",
+        description: "Inserisci un effort positivo prima di creare la task.",
+      });
+      return;
+    }
+    if (!selectedDeveloper) {
+      toast({
+        variant: "destructive",
+        title: "Developer obbligatorio",
+        description: "Seleziona il developer assegnatario della modifica.",
+      });
+      return;
+    }
+
+    setSubmittingPostPreviewChange(true);
+    try {
+      const changeTicket = await createPostPreviewChangeChildTicket({
+        parentTicket: ticket,
+        changeNotes: normalizedNotes,
+        effortHours: normalizedEffort,
+        assignedDeveloperId: selectedDeveloper.id,
+      });
+
+      await updateTicketWithAudit(
+        ticket.id,
+        {
+          post_preview_requested_at: new Date().toISOString(),
+          post_preview_requested_by: user?.email || user?.full_name || "user",
+          post_preview_requested_by_id: user?.id || null,
+          post_preview_last_child_ticket_id: changeTicket.id,
+          post_preview_notes: normalizedNotes,
+        },
+        "post_preview_change_requested",
+        `Modifica post-preview richiesta e assegnata a ${changeTicket.assignee_name || "developer"} (${normalizedEffort}h)`
+      );
+
+      await notifyClientSupervisor({
+        ticketOverride: {
+          ...ticket,
+          post_preview_last_child_ticket_id: changeTicket.id,
+          post_preview_notes: normalizedNotes,
+        },
+        title: "Modifica post-preview richiesta",
+        body: `${ticket.title} · task assegnata a ${changeTicket.assignee_name || "developer"} (${normalizedEffort}h)`,
+        metadata: {
+          reason: "post_preview_change_requested",
+          child_ticket_id: changeTicket.id,
+        },
+      });
+
+      await queryClient.invalidateQueries({ queryKey: ["ticket", ticketId] });
+      await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+
+      setPostPreviewDialog(false);
+      setPostPreviewNotes("");
+      setPostPreviewEffortInput(String(POST_PREVIEW_CHANGE_EFFORT_HOURS));
+      setPostPreviewAssigneeId(resolveTicketAssigneeDeveloper(ticket)?.id || "");
+      toast({
+        title: "Modifica post-preview creata",
+        description: `La task e stata inserita nella pipeline di ${changeTicket.assignee_name || "developer"}.`,
+      });
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Creazione modifica non riuscita",
+        description: error?.message || "Riprova tra qualche secondo.",
+      });
+    } finally {
+      setSubmittingPostPreviewChange(false);
     }
   };
 
@@ -2728,6 +3121,8 @@ export default function TicketDetail() {
   const plannedEffort = getPlannedEffortHours(ticket);
   const actualEffort = getActualEffortHours(ticket);
   const priorityPaused = isPriorityPaused(ticket);
+  const ticketBlocked = isTicketBlocked(ticket);
+  const scheduleSlipCount = Number(ticket.schedule_slip_count) || 0;
   const priority = getPriorityLevel(effectivePriority);
   const normalizedStatus = getTicketWorkflowStatus(ticket);
   const status = STATUS_CONFIG[normalizedStatus] || STATUS_CONFIG.new;
@@ -2788,7 +3183,7 @@ export default function TicketDetail() {
   const canEditDeadline = !isLiveOpsTicket && (isAdmin || isAnalyst || canManageAsTechSupervisor);
   const canEditPlannedEffort = !isLiveOpsTicket && (isAdmin || isAnalyst || canManageAsTechSupervisor || isAssignedDeveloper);
   const canEditActualEffort =
-    isClosedStatus(ticket.status) &&
+    isTicketClosed(ticket) &&
     (
       isAdmin ||
       (isLiveOpsTicket
@@ -2915,6 +3310,15 @@ export default function TicketDetail() {
         });
       })
     : developers.filter((developer) => developer.active !== false);
+  const postPreviewAssignableDevelopers = (() => {
+    const sourceDeveloper = resolveTicketAssigneeDeveloper(ticket);
+    const byId = new Map();
+    assignableDevelopers.forEach((developer) => {
+      if (developer?.id) byId.set(developer.id, developer);
+    });
+    if (sourceDeveloper?.id) byId.set(sourceDeveloper.id, sourceDeveloper);
+    return [...byId.values()];
+  })();
   const analystBelongsToClient = (() => {
     if (!isAnalyst || !client) return false;
     if ((client.analyst_team_ids || []).includes(user?.id)) return true;
@@ -2942,17 +3346,32 @@ export default function TicketDetail() {
   })();
   const canFlagMissingData =
     ticketKind === "main" &&
-    !isClosedStatus(ticket.status) &&
+    !isTicketClosed(ticket) &&
     !priorityPaused &&
     (isAssignedDeveloper || isAdmin);
   const canReactivateMissingData =
     ticketKind === "main" &&
-    !isClosedStatus(ticket.status) &&
+    !isTicketClosed(ticket) &&
     priorityPaused &&
     (isAdmin || (isDeveloper && missingDataReporterMatchesUser));
   const canManageMissingData = canFlagMissingData || canReactivateMissingData;
+  const ticketWatchers = normalizeTicketWatchers(ticket);
+  const isCurrentUserWatching = ticketWatchers.some((watcher) => watcherMatchesUser(watcher, user));
+  const canManageWatchers = isAdmin || isAnalyst || canManageAsTechSupervisor || isTechSupervisor;
+  const watcherOptions = users
+    .filter((candidate) => {
+      if (!candidate?.id && !candidate?.email) return false;
+      return !ticketWatchers.some((watcher) => watcherMatchesUser(watcher, candidate));
+    })
+    .sort((a, b) =>
+      String(a?.full_name || a?.email || "").localeCompare(String(b?.full_name || b?.email || ""), "it", {
+        sensitivity: "base",
+      })
+    );
+  const selectedWatcherToAdd =
+    users.find((candidate) => (candidate.id || candidate.email) === watcherToAddId) || null;
   const hiddenReportedStatus = ([key]) => key !== "reported" || normalizedStatus === "reported";
-  const availableStatusEntries = isQaFixTicket || isLiveOpsTicket
+  const availableStatusEntries = isQaFixTicket || isLiveOpsTicket || isPostPreviewChangeTicket
     ? Object.entries(STATUS_CONFIG).filter(
         ([key]) => hiddenReportedStatus([key]) && ["new", "in_progress", "done"].includes(key)
       )
@@ -3020,27 +3439,142 @@ export default function TicketDetail() {
   const hasOpenLiveOpsByType = new Set(
     openLiveOpsTickets.map((entry) => normalizeLiveOperationType(entry.live_operation_type))
   );
+  const openPostPreviewChangeTickets = !ticket?.id
+    ? []
+    : tickets.filter(
+        (entry) =>
+          normalizeTicketKind(entry) === "post_preview_change" &&
+          String(entry.parent_ticket_id || "") === String(ticket.id) &&
+          !isClosedStatus(entry.status)
+      );
+  const canRequestPostPreviewChange =
+    ticketKind === "main" &&
+    (isAdmin || isAnalyst || canManageAsTechSupervisor) &&
+    ["done", "reported"].includes(normalizedStatus);
   const canRequestLiveOps = ticketKind === "main" && (isAdmin || analystBelongsToClient);
   const canRequestLaunch = canRequestLiveOps && ["done", "reported"].includes(normalizedStatus) && (currentLiveState === "not_live" || currentLiveState === "stopped");
   const canRequestChange = canRequestLiveOps && ["done", "reported"].includes(normalizedStatus) && currentLiveState === "live";
   const canRequestStop = canRequestLiveOps && ["done", "reported"].includes(normalizedStatus) && currentLiveState === "live";
   const liveOpsOperationType = normalizeLiveOperationType(liveOpsForm.operation_type);
   const isStopLiveOperation = liveOpsOperationType === "stop";
+  const postPreviewEffortHours = normalizeEffortHours(postPreviewEffortInput);
+  const postPreviewAssigneeIsValid = Boolean(resolveActiveDeveloperById(postPreviewAssigneeId));
+  const postPreviewSubmitDisabled =
+    submittingPostPreviewChange ||
+    !String(postPreviewNotes || "").trim() ||
+    !postPreviewEffortHours ||
+    !postPreviewAssigneeIsValid;
+  const liveOpsEffortHours = normalizeEffortHours(liveOpsForm.effort_hours);
+  const liveOpsAssigneeIsValid = Boolean(resolveActiveDeveloperById(liveOpsForm.assignee_id));
   const liveOpsSubmitDisabled =
     submittingLiveOps ||
+    !liveOpsEffortHours ||
+    !liveOpsAssigneeIsValid ||
     (isStopLiveOperation
       ? !String(liveOpsForm.outcome || "").trim()
       : !String(liveOpsForm.split || "").trim() || !String(liveOpsForm.target || "").trim());
+
+  const updateTicketWatchers = async (nextWatchers, auditAction, auditDetails) => {
+    await updateMutation.mutateAsync({
+      data: {
+        watchers: normalizeTicketWatchers(nextWatchers),
+      },
+      auditAction,
+      auditDetails,
+    });
+  };
+
+  const handleToggleCurrentWatcher = async () => {
+    if (!user?.id && !user?.email) return;
+
+    if (isCurrentUserWatching) {
+      const nextWatchers = ticketWatchers.filter((watcher) => !watcherMatchesUser(watcher, user));
+      await updateTicketWatchers(
+        nextWatchers,
+        "watcher_removed",
+        `${user?.full_name || user?.email || "Utente"} non segue piu il ticket`
+      );
+      toast({
+        title: "Watcher rimosso",
+        description: "Non riceverai piu notifiche dedicate per questo ticket.",
+      });
+      return;
+    }
+
+    const nextWatcher = {
+      ...buildWatcherFromUser(user),
+      added_by: user?.email || user?.full_name || "user",
+    };
+    await updateTicketWatchers(
+      [...ticketWatchers, nextWatcher],
+      "watcher_added",
+      `${nextWatcher.name || nextWatcher.email} segue il ticket`
+    );
+    toast({
+      title: "Watcher aggiunto",
+      description: "Riceverai notifiche sugli aggiornamenti del ticket.",
+    });
+  };
+
+  const handleAddWatcher = async () => {
+    if (!selectedWatcherToAdd) return;
+
+    const nextWatcher = {
+      ...buildWatcherFromUser(selectedWatcherToAdd),
+      added_by: user?.email || user?.full_name || "user",
+    };
+    const nextWatchers = normalizeTicketWatchers([...ticketWatchers, nextWatcher]);
+
+    await updateTicketWatchers(
+      nextWatchers,
+      "watcher_added",
+      `${nextWatcher.name || nextWatcher.email} aggiunto come watcher`
+    );
+
+    await notifyWatcherAdded({
+      ticket: {
+        ...ticket,
+        watchers: nextWatchers,
+      },
+      actor: user,
+      watcher: selectedWatcherToAdd,
+    }).catch(() => {});
+
+    setWatcherToAddId("");
+    toast({
+      title: "Watcher aggiunto",
+      description: `${nextWatcher.name || nextWatcher.email} ricevera notifiche sul ticket.`,
+    });
+  };
+
+  const handleRemoveWatcher = async (watcher) => {
+    const watcherKey = getWatcherKey(watcher);
+    if (!watcherKey) return;
+    const canRemove = canManageWatchers || watcherMatchesUser(watcher, user);
+    if (!canRemove) return;
+
+    const nextWatchers = ticketWatchers.filter((entry) => getWatcherKey(entry) !== watcherKey);
+    await updateTicketWatchers(
+      nextWatchers,
+      "watcher_removed",
+      `${watcher.name || watcher.email || "Watcher"} rimosso dai watcher`
+    );
+    toast({
+      title: "Watcher rimosso",
+      description: "La lista watcher e stata aggiornata.",
+    });
+  };
 
   const handleMissingDataToggle = async () => {
     if (!ticket?.assignee_id) return;
 
     const nextPaused = !priorityPaused;
-    const nextStatus = nextPaused ? "new" : normalizedStatus;
+    const currentStatus = normalizeTicketStatus(ticket.status);
+    const nextStatus = nextPaused ? "blocked" : (currentStatus === "blocked" ? "new" : currentStatus);
     const nextPriorityScore = nextPaused
       ? 0
       : calculatePriorityScore(
-          { ...ticket, missing_required_data: false, priority_override: null },
+          { ...ticket, status: nextStatus, missing_required_data: false, priority_override: null },
           client,
           config
         );
@@ -3472,6 +4006,16 @@ export default function TicketDetail() {
                     });
                     return;
                   }
+                  if (payload.postPreviewChangeComplete) {
+                    await completePostPreviewChangeTransition({
+                      statusOptions: {
+                        completionMode: "now",
+                        completionDate: payload.nowDate,
+                        completionTime: payload.nowTime,
+                      },
+                    });
+                    return;
+                  }
                   if (payload.qaPayload) {
                     await completeQaReviewTransition({
                       qaPayload: payload.qaPayload,
@@ -3511,6 +4055,16 @@ export default function TicketDetail() {
                   }
                   if (payload.liveOpsComplete) {
                     await completeLiveOpsTransition({
+                      statusOptions: {
+                        completionMode: "planned",
+                        completionDate: payload.plannedDate,
+                        completionTime: payload.plannedTime,
+                      },
+                    });
+                    return;
+                  }
+                  if (payload.postPreviewChangeComplete) {
+                    await completePostPreviewChangeTransition({
                       statusOptions: {
                         completionMode: "planned",
                         completionDate: payload.plannedDate,
@@ -3576,6 +4130,11 @@ export default function TicketDetail() {
                     Live ops
                   </Badge>
                 )}
+                {isPostPreviewChangeTicket && (
+                  <Badge variant="outline" className="border-0 bg-amber-100 text-amber-800 text-xs dark:bg-amber-500/15 dark:text-amber-300">
+                    Post-preview
+                  </Badge>
+                )}
                 {ticketKind === "main" && (
                   <Badge variant="outline" className="border-0 bg-slate-100 text-slate-700 text-xs dark:bg-slate-500/15 dark:text-slate-200">
                     {liveStateLabel}
@@ -3589,9 +4148,14 @@ export default function TicketDetail() {
                     Conferma: {liveOperationMeta.confirmationLabel}
                   </Badge>
                 )}
-                {priorityPaused && (
+                {ticketBlocked && (
                   <Badge variant="outline" className="border-0 bg-amber-100 text-amber-700 text-xs dark:bg-amber-500/15 dark:text-amber-300">
-                    Mancano dati
+                    {priorityPaused ? "Mancano dati" : "In pausa"}
+                  </Badge>
+                )}
+                {scheduleSlipCount > 0 && (
+                  <Badge variant="outline" className="border-0 bg-amber-100 text-amber-800 text-xs dark:bg-amber-500/15 dark:text-amber-300">
+                    Slittato {scheduleSlipCount}x
                   </Badge>
                 )}
                 {isAdmin && (
@@ -3933,6 +4497,84 @@ export default function TicketDetail() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={postPreviewDialog} onOpenChange={setPostPreviewDialog}>
+        <DialogContent className="flex w-[calc(100vw-32px)] max-h-[calc(100vh-112px)] max-w-xl flex-col gap-0 overflow-hidden rounded-[30px] border border-border/70 bg-card p-0 shadow-[var(--shadow-hover)] sm:w-[calc(100vw-64px)] sm:max-h-[calc(100vh-128px)]">
+          <DialogHeader className="shrink-0 border-b border-border/70 px-6 py-5 text-left sm:px-7 sm:py-6">
+            <p className={sectionEyebrowClass}>Post-preview</p>
+            <DialogTitle className="text-2xl font-semibold tracking-tight text-foreground">
+              Richiedi modifica post-preview
+            </DialogTitle>
+            <DialogDescription className="text-sm">
+              Viene creata una task collegata al ticket principale e inserita prima della prossima attivita pianificata del developer scelto.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4 sm:px-7 sm:py-5">
+            <div className="space-y-1.5 rounded-[24px] bg-muted/20 p-4 sm:p-5">
+              <label className={sidebarLabelClass}>Cosa va modificato *</label>
+              <Textarea
+                value={postPreviewNotes}
+                onChange={(event) => setPostPreviewNotes(event.target.value)}
+                placeholder="Riassumi la richiesta del cliente e cosa deve essere aggiornato."
+                className="min-h-[160px] resize-y text-sm leading-6"
+              />
+              <div className="grid gap-4 pt-3 md:grid-cols-2">
+                <div className="space-y-1.5">
+                  <label className={sidebarLabelClass}>Effort previsto (h) *</label>
+                  <Input
+                    type="number"
+                    min="0.5"
+                    step="0.5"
+                    value={postPreviewEffortInput}
+                    onChange={(event) => setPostPreviewEffortInput(event.target.value)}
+                    className="h-11 text-sm"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className={sidebarLabelClass}>Developer assegnatario *</label>
+                  <Select
+                    value={postPreviewAssigneeId}
+                    onValueChange={setPostPreviewAssigneeId}
+                  >
+                    <SelectTrigger className="h-11 text-sm">
+                      <SelectValue placeholder="Seleziona developer" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {postPreviewAssignableDevelopers.map((developer) => (
+                        <SelectItem key={developer.id} value={developer.id}>
+                          {developer.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="shrink-0 border-t border-border/70 px-6 py-4 sm:px-7 sm:py-5">
+            <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <Button
+                variant="outline"
+                className="h-10 rounded-xl text-sm sm:min-w-[140px]"
+                onClick={() => setPostPreviewDialog(false)}
+                disabled={submittingPostPreviewChange}
+              >
+                Annulla
+              </Button>
+              <Button
+                className="h-10 rounded-xl bg-amber-600 text-sm text-white hover:bg-amber-700 sm:min-w-[180px]"
+                onClick={handlePostPreviewChangeSubmit}
+                disabled={postPreviewSubmitDisabled}
+              >
+                {submittingPostPreviewChange ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Crea task
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={liveOpsDialog} onOpenChange={setLiveOpsDialog}>
         <DialogContent className="flex w-[calc(100vw-32px)] max-h-[calc(100vh-112px)] max-w-2xl flex-col gap-0 overflow-hidden rounded-[30px] border border-border/70 bg-card p-0 shadow-[var(--shadow-hover)] sm:w-[calc(100vw-64px)] sm:max-h-[calc(100vh-128px)]">
           <DialogHeader className="shrink-0 border-b border-border/70 px-6 py-5 text-left sm:px-7 sm:py-6">
@@ -3941,7 +4583,7 @@ export default function TicketDetail() {
               Richiedi {getLiveOperationLabel(liveOpsForm.operation_type).toLowerCase()}
             </DialogTitle>
             <DialogDescription className="text-sm">
-              Viene creata una task operativa nella pipeline del tech supervisor del cliente.
+              Viene creata una task operativa e inserita prima della prossima attivita pianificata del developer scelto.
             </DialogDescription>
           </DialogHeader>
 
@@ -3974,6 +4616,42 @@ export default function TicketDetail() {
                     ))}
                   </SelectContent>
                 </Select>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-1.5">
+                  <label className={sidebarLabelClass}>Effort previsto (h) *</label>
+                  <Input
+                    type="number"
+                    min="0.5"
+                    step="0.5"
+                    value={liveOpsForm.effort_hours}
+                    onChange={(event) =>
+                      setLiveOpsForm((prev) => ({ ...prev, effort_hours: event.target.value }))
+                    }
+                    className="h-11 text-sm"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className={sidebarLabelClass}>Developer assegnatario *</label>
+                  <Select
+                    value={liveOpsForm.assignee_id || ""}
+                    onValueChange={(value) =>
+                      setLiveOpsForm((prev) => ({ ...prev, assignee_id: value }))
+                    }
+                  >
+                    <SelectTrigger className="h-11 text-sm">
+                      <SelectValue placeholder="Seleziona developer" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {assignableDevelopers.map((developer) => (
+                        <SelectItem key={developer.id} value={developer.id}>
+                          {developer.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
               </div>
 
               {isStopLiveOperation ? (
@@ -4229,11 +4907,15 @@ export default function TicketDetail() {
                                   </Link>
                                 </div>
                               )}
-                              {(isQaFixTicket || isQaReviewTicket) && (
+                              {(isQaFixTicket || isQaReviewTicket || isPostPreviewChangeTicket) && (
                                 <div className="rounded-2xl border border-border/60 bg-background/80 p-4">
                                   <p className={sidebarLabelClass}>Tipo task</p>
                                   <p className="mt-2 text-sm font-medium text-foreground">
-                                    {isQaReviewTicket ? "Review preview" : "QA fix"}
+                                    {isQaReviewTicket
+                                      ? "Review preview"
+                                      : isPostPreviewChangeTicket
+                                        ? "Modifica post-preview"
+                                        : "QA fix"}
                                   </p>
                                 </div>
                               )}
@@ -4658,6 +5340,88 @@ export default function TicketDetail() {
               });
             }}
           />
+
+          <Card className={surfaceCardClass}>
+            <CardHeader className="pb-0">
+              <div className="flex items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <p className={sectionEyebrowClass}>Notifiche</p>
+                  <CardTitle className="text-lg font-semibold">Watcher</CardTitle>
+                </div>
+                <Badge variant="secondary" className="rounded-full px-2.5 py-1 text-[10px]">
+                  {ticketWatchers.length}
+                </Badge>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <Button
+                type="button"
+                variant={isCurrentUserWatching ? "secondary" : "outline"}
+                className="h-9 w-full rounded-xl text-xs"
+                onClick={handleToggleCurrentWatcher}
+                disabled={!user?.id && !user?.email}
+              >
+                <Bell className="h-3.5 w-3.5" />
+                {isCurrentUserWatching ? "Non seguire piu" : "Segui ticket"}
+              </Button>
+
+              {canManageWatchers && (
+                <div className="flex gap-2">
+                  <Select value={watcherToAddId} onValueChange={setWatcherToAddId}>
+                    <SelectTrigger className="h-9 min-w-0 flex-1 text-sm">
+                      <SelectValue placeholder="Aggiungi watcher" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {watcherOptions.map((candidate) => (
+                        <SelectItem key={candidate.id || candidate.email} value={candidate.id || candidate.email}>
+                          {candidate.full_name || candidate.email}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="h-9 shrink-0 rounded-xl"
+                    onClick={handleAddWatcher}
+                    disabled={!selectedWatcherToAdd}
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              )}
+
+              {ticketWatchers.length > 0 ? (
+                <div className="flex flex-wrap gap-2">
+                  {ticketWatchers.map((watcher) => {
+                    const canRemoveWatcher = canManageWatchers || watcherMatchesUser(watcher, user);
+                    return (
+                      <span
+                        key={getWatcherKey(watcher)}
+                        className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-border/70 bg-muted/35 px-2.5 py-1 text-[11px] text-foreground"
+                      >
+                        <span className="truncate">{watcher.name || watcher.email}</span>
+                        {canRemoveWatcher && (
+                          <button
+                            type="button"
+                            className="rounded-full text-muted-foreground transition-colors hover:text-destructive"
+                            onClick={() => handleRemoveWatcher(watcher)}
+                            aria-label={`Rimuovi ${watcher.name || watcher.email} dai watcher`}
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </span>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="rounded-2xl border border-dashed border-border/65 bg-muted/15 px-3 py-3 text-xs text-muted-foreground">
+                  Nessun watcher impostato.
+                </p>
+              )}
+            </CardContent>
+          </Card>
           
           {/* Continuation indicator */}
           {ticket.audit_log && ticket.audit_log.some(a => a.action === "auto_split") && (
@@ -4704,6 +5468,32 @@ export default function TicketDetail() {
                       Rifiuta preview
                     </Button>
                   </div>
+                </div>
+              )}
+
+              {canRequestPostPreviewChange && (
+                <div className="rounded-2xl border border-amber-200 bg-amber-50/90 p-4 sm:p-5 dark:border-amber-500/30 dark:bg-amber-500/10">
+                  <p className="text-xs font-semibold uppercase tracking-[0.24em] text-amber-800 dark:text-amber-300">
+                    Post-preview
+                  </p>
+                  <p className="mt-2 text-sm text-amber-900 dark:text-amber-100">
+                    Se il cliente chiede modifiche dopo l&apos;approvazione, crea una task collegata e scegli effort e developer.
+                  </p>
+                  {openPostPreviewChangeTickets.length > 0 && (
+                    <p className="mt-2 text-[11px] text-amber-800/90 dark:text-amber-200/90">
+                      C&apos;e gia una modifica post-preview aperta in pipeline dev.
+                    </p>
+                  )}
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="mt-3 h-auto min-h-10 w-full rounded-xl px-3 py-2 text-center text-xs leading-tight whitespace-normal"
+                    onClick={openPostPreviewChangeDialog}
+                    disabled={openPostPreviewChangeTickets.length > 0}
+                  >
+                    Richiedi modifica post-preview
+                  </Button>
                 </div>
               )}
 
@@ -4775,7 +5565,7 @@ export default function TicketDetail() {
                 </div>
               )}
 
-              {isLiveOpsTicket && canManageLiveOps && !isClosedStatus(ticket.status) && (
+              {isLiveOpsTicket && canManageLiveOps && !isTicketClosed(ticket) && (
                 <div className="rounded-2xl border border-emerald-200 bg-emerald-50/90 p-4 dark:border-emerald-500/30 dark:bg-emerald-500/10">
                   <p className="text-xs font-semibold uppercase tracking-[0.24em] text-emerald-700 dark:text-emerald-300">
                     Task live ops
@@ -4951,7 +5741,7 @@ export default function TicketDetail() {
                   </div>
                 ) : (
                   <p className="text-sm text-gray-400 italic">
-                    {isClosedStatus(ticket.status) ? "Non ancora valorizzato" : "Disponibile a consuntivo"}
+                    {isTicketClosed(ticket) ? "Non ancora valorizzato" : "Disponibile a consuntivo"}
                   </p>
                 )}
                 {canEditActualEffort && (

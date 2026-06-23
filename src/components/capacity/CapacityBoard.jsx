@@ -4,12 +4,12 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Clock, AlertTriangle } from "lucide-react";
-import { getPlannedEffortHours, isOpenStatus } from "../shared/priorityUtils";
+import { getPlannedEffortHours, isSchedulableTicket } from "../shared/priorityUtils";
 
 export default function CapacityBoard({ developers, tickets }) {
   const devCapacity = developers.filter(d => d.active !== false).map(dev => {
     const assignedTickets = tickets.filter(
-      (t) => t.assignee_id === dev.id && isOpenStatus(t.status)
+      (t) => t.assignee_id === dev.id && isSchedulableTicket(t)
     );
     const totalAllocated = assignedTickets.reduce((s, t) => s + getPlannedEffortHours(t), 0);
     const weeklyCapacity = (dev.daily_capacity || 8) * 5;

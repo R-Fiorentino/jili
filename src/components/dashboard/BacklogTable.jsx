@@ -4,6 +4,10 @@ import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import ClientSelect from "@/components/shared/ClientSelect";
+import usePersistedState from "@/components/shared/usePersistedState";
 import {
   getPriorityLevel,
   STATUS_CONFIG,
@@ -15,11 +19,12 @@ import {
   getEffectivePriorityScore,
   getPlannedEffortHours,
   isPriorityPaused,
-  isClosedStatus,
+  isTicketBlocked,
+  isTicketClosed,
 } from "../shared/priorityUtils";
 import { Link } from "react-router-dom";
 import { createTicketDetailUrl } from "@/utils";
-import { Clock, Search, ArrowUpDown } from "lucide-react";
+import { Check, Clock, Search, ArrowUpDown, SlidersHorizontal, X } from "lucide-react";
 import moment from "moment";
 
 export default function BacklogTable({
@@ -30,17 +35,34 @@ export default function BacklogTable({
   fillHeight = false,
   showTypeColumn = true,
   showPlanningStartColumn = false,
+  showDifficultyFilter = true,
   defaultSortField,
   defaultSortDir,
   detailFromPage = "dashboard",
 }) {
   const totalColumns = 6 + (showTypeColumn ? 1 : 0) + (showPlanningStartColumn ? 1 : 0);
-  const [search, setSearch] = React.useState("");
-  const [filterClient, setFilterClient] = React.useState("all");
-  const [filterStatus, setFilterStatus] = React.useState("all");
-  const [filterDifficulty, setFilterDifficulty] = React.useState("all");
-  const [sortField, setSortField] = React.useState(() => defaultSortField || (showPriorityScore ? "priority_score" : "created_date"));
-  const [sortDir, setSortDir] = React.useState(() => defaultSortDir ?? 1);
+  const persistenceKey = `backlog-table:${detailFromPage}:${showPriorityScore ? "score" : "workflow"}`;
+  const [search, setSearch] = usePersistedState(`${persistenceKey}:search`, "");
+  const [filterClient, setFilterClient] = usePersistedState(`${persistenceKey}:client`, "all");
+  const [filterStatuses, setFilterStatuses] = usePersistedState(`${persistenceKey}:statuses`, () => {
+    if (typeof window === "undefined") return [];
+    try {
+      const rawLegacyStatus = window.sessionStorage.getItem(`${persistenceKey}:status`);
+      const legacyStatus = rawLegacyStatus ? JSON.parse(rawLegacyStatus) : "all";
+      return legacyStatus && legacyStatus !== "all" && STATUS_CONFIG[legacyStatus] ? [legacyStatus] : [];
+    } catch {
+      return [];
+    }
+  });
+  const [filterDifficulty, setFilterDifficulty] = usePersistedState(`${persistenceKey}:difficulty`, "all");
+  const [sortField, setSortField] = usePersistedState(
+    `${persistenceKey}:sortField`,
+    () => defaultSortField || (showPriorityScore ? "priority_score" : "created_date")
+  );
+  const [sortDir, setSortDir] = usePersistedState(
+    `${persistenceKey}:sortDir`,
+    () => defaultSortDir ?? 1
+  );
 
   const getPlanningStartTimestamp = React.useCallback((ticket) => {
     if (!ticket?.scheduled_date) return null;
@@ -51,12 +73,40 @@ export default function BacklogTable({
     return Number.isNaN(timestamp) ? null : timestamp;
   }, []);
 
+  React.useEffect(() => {
+    if (filterClient === "all") return;
+    const stillAvailable = clients.some((client) => client.id === filterClient);
+    if (!stillAvailable) setFilterClient("all");
+  }, [clients, filterClient, setFilterClient]);
+
+  const selectedStatuses = React.useMemo(
+    () => (Array.isArray(filterStatuses) ? filterStatuses.filter((status) => STATUS_CONFIG[status]) : []),
+    [filterStatuses]
+  );
+  const selectedStatusSet = React.useMemo(() => new Set(selectedStatuses), [selectedStatuses]);
+
+  React.useEffect(() => {
+    if (Array.isArray(filterStatuses) && filterStatuses.length === selectedStatuses.length) return;
+    setFilterStatuses(selectedStatuses);
+  }, [filterStatuses, selectedStatuses, setFilterStatuses]);
+
+  const toggleStatusFilter = (status) => {
+    if (!STATUS_CONFIG[status]) return;
+    setFilterStatuses((current) => {
+      const currentStatuses = Array.isArray(current) ? current.filter((item) => STATUS_CONFIG[item]) : [];
+      if (currentStatuses.includes(status)) {
+        return currentStatuses.filter((item) => item !== status);
+      }
+      return [...currentStatuses, status];
+    });
+  };
+
   const filtered = tickets
     .filter(t => {
       if (search && !t.title.toLowerCase().includes(search.toLowerCase())) return false;
       if (filterClient !== "all" && t.client_id !== filterClient) return false;
-      if (filterStatus !== "all" && getTicketWorkflowStatus(t) !== filterStatus) return false;
-      if (filterDifficulty !== "all" && t.difficulty !== filterDifficulty) return false;
+      if (selectedStatusSet.size > 0 && !selectedStatusSet.has(getTicketWorkflowStatus(t))) return false;
+      if (showDifficultyFilter && filterDifficulty !== "all" && t.difficulty !== filterDifficulty) return false;
       return true;
     })
     .sort((a, b) => {
@@ -111,35 +161,87 @@ export default function BacklogTable({
             />
           </div>
           <div className="flex flex-wrap gap-2">
-            <Select value={filterClient} onValueChange={setFilterClient}>
-              <SelectTrigger className="h-10 w-40 bg-muted/55 text-sm">
-                <SelectValue placeholder="Client" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All Clients</SelectItem>
-                {clients.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
-              </SelectContent>
-            </Select>
-            <Select value={filterStatus} onValueChange={setFilterStatus}>
-              <SelectTrigger className="h-10 w-40 bg-muted/55 text-sm">
-                <SelectValue placeholder="Status" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All Status</SelectItem>
-                {Object.entries(STATUS_CONFIG).map(([k, v]) => <SelectItem key={k} value={k}>{v.label}</SelectItem>)}
-              </SelectContent>
-            </Select>
-            <Select value={filterDifficulty} onValueChange={setFilterDifficulty}>
-              <SelectTrigger className="h-10 w-32 bg-muted/55 text-sm">
-                <SelectValue placeholder="Difficulty" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All</SelectItem>
-                <SelectItem value="easy">Easy</SelectItem>
-                <SelectItem value="medium">Medium</SelectItem>
-                <SelectItem value="hard">Hard</SelectItem>
-              </SelectContent>
-            </Select>
+            <ClientSelect
+              clients={clients}
+              value={filterClient}
+              onValueChange={setFilterClient}
+              placeholder="Client"
+              searchPlaceholder="Search client..."
+              allValue="all"
+              allLabel="All Clients"
+              triggerClassName="w-40 bg-muted/55 text-sm"
+            />
+            <Popover>
+              <PopoverTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="h-10 w-44 justify-between rounded-xl bg-muted/55 px-3 text-sm font-normal"
+                >
+                  <span className="inline-flex min-w-0 items-center gap-2">
+                    <SlidersHorizontal className="h-4 w-4 shrink-0 text-muted-foreground" />
+                    <span className="truncate">
+                      {selectedStatuses.length > 0 ? `${selectedStatuses.length} status` : "All Status"}
+                    </span>
+                  </span>
+                  {selectedStatuses.length > 0 ? (
+                    <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
+                      {selectedStatuses.length}
+                    </span>
+                  ) : null}
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent align="start" className="w-64 rounded-2xl border-border/70 bg-card/95 p-3 shadow-[var(--shadow-hover)]">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Status</p>
+                  {selectedStatuses.length > 0 ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 px-2 text-[11px]"
+                      onClick={() => setFilterStatuses([])}
+                    >
+                      <X className="h-3 w-3" />
+                      Reset
+                    </Button>
+                  ) : null}
+                </div>
+                <div className="space-y-1">
+                  {Object.entries(STATUS_CONFIG).map(([key, value]) => {
+                    const selected = selectedStatusSet.has(key);
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        className="flex w-full items-center gap-2 rounded-xl px-2 py-2 text-left text-sm transition-colors hover:bg-muted/60"
+                        onClick={() => toggleStatusFilter(key)}
+                      >
+                        <span className={`flex h-4 w-4 items-center justify-center rounded border ${selected ? "border-primary bg-primary text-primary-foreground" : "border-border bg-background"}`}>
+                          {selected ? <Check className="h-3 w-3" /> : null}
+                        </span>
+                        <Badge variant="outline" className={`${value.color} border-0 text-[10px]`}>
+                          {value.label}
+                        </Badge>
+                      </button>
+                    );
+                  })}
+                </div>
+              </PopoverContent>
+            </Popover>
+            {showDifficultyFilter && (
+              <Select value={filterDifficulty} onValueChange={setFilterDifficulty}>
+                <SelectTrigger className="h-10 w-32 bg-muted/55 text-sm">
+                  <SelectValue placeholder="Difficulty" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All</SelectItem>
+                  <SelectItem value="easy">Easy</SelectItem>
+                  <SelectItem value="medium">Medium</SelectItem>
+                  <SelectItem value="hard">Hard</SelectItem>
+                </SelectContent>
+              </Select>
+            )}
           </div>
         </div>
       </div>
@@ -190,16 +292,18 @@ export default function BacklogTable({
               const type = TYPE_CONFIG[ticket.type] || TYPE_CONFIG.other;
               const plannedEffort = getPlannedEffortHours(ticket);
               const actualEffort = getActualEffortHours(ticket);
+              const ticketBlocked = isTicketBlocked(ticket);
+              const scheduleSlipCount = Number(ticket.schedule_slip_count) || 0;
               return (
                 <TableRow key={ticket.id} className="group cursor-pointer hover:bg-muted/30">
                   <TableCell>
                     <div className="flex items-center gap-2">
-                      <div className={`h-2.5 w-2.5 rounded-full ${priorityPaused ? "bg-amber-500" : priority.color}`} />
+                      <div className={`h-2.5 w-2.5 rounded-full ${ticketBlocked ? "bg-amber-500" : priority.color}`} />
                       {showPriorityScore ? (
                         <span className="text-sm font-bold text-foreground">{effectivePriority}</span>
                       ) : (
                         <span className="text-xs font-medium text-muted-foreground">
-                          {priorityPaused ? "Mancano dati" : priority.label}
+                          {ticketBlocked ? (priorityPaused ? "Mancano dati" : "In pausa") : priority.label}
                         </span>
                       )}
                     </div>
@@ -207,7 +311,14 @@ export default function BacklogTable({
                   <TableCell>
                     <Link to={createTicketDetailUrl(ticket.id, detailFromPage)} className="group-hover:text-blue-600 transition-colors">
                       <p className="line-clamp-1 text-sm font-semibold text-foreground">{ticket.title}</p>
-                      <p className="font-mono text-[10px] text-muted-foreground">#{ticket.id?.slice(-6)}</p>
+                      <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                        <span className="font-mono text-[10px] text-muted-foreground">#{ticket.id?.slice(-6)}</span>
+                        {scheduleSlipCount > 0 ? (
+                          <Badge variant="outline" className="border-amber-200 bg-amber-50 px-1.5 py-0 text-[10px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/15 dark:text-amber-300">
+                            Slittato {scheduleSlipCount}x
+                          </Badge>
+                        ) : null}
+                      </div>
                     </Link>
                   </TableCell>
                   <TableCell className="text-sm text-muted-foreground">{ticket.client_name || "—"}</TableCell>
@@ -234,7 +345,7 @@ export default function BacklogTable({
                     <Badge variant="outline" className={`${status.color} text-[10px]`}>{status.label}</Badge>
                   </TableCell>
                   <TableCell>
-                    {isClosedStatus(ticket.status) && actualEffort > 0 ? (
+                    {isTicketClosed(ticket) && actualEffort > 0 ? (
                       <span className="flex items-center gap-1 text-sm font-medium"><Clock className="h-3 w-3 text-muted-foreground" />{actualEffort}h</span>
                     ) : plannedEffort > 0 ? (
                       <span className="flex items-center gap-1 text-sm text-amber-600"><Clock className="h-3 w-3" />~{plannedEffort}h</span>

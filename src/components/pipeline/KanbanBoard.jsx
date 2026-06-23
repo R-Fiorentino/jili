@@ -4,7 +4,7 @@ import {
   STATUS_CONFIG,
   PIPELINE_ORDER,
   compareTicketsByPriority,
-  normalizeTicketStatus,
+  getTicketWorkflowStatus,
 } from "../shared/priorityUtils";
 import TicketCard from "../shared/TicketCard";
 
@@ -13,7 +13,7 @@ export default function KanbanBoard({ tickets, onStatusChange, showPriorityScore
     id: status,
     ...STATUS_CONFIG[status],
     tickets: tickets
-      .filter((t) => normalizeTicketStatus(t.status) === status)
+      .filter((t) => getTicketWorkflowStatus(t) === status)
       .sort(compareTicketsByPriority),
   }));
 
@@ -22,7 +22,7 @@ export default function KanbanBoard({ tickets, onStatusChange, showPriorityScore
     const ticketId = result.draggableId;
     const newStatus = result.destination.droppableId;
     const ticket = tickets.find(t => t.id === ticketId);
-    if (!ticket || normalizeTicketStatus(ticket.status) === newStatus) return;
+    if (!ticket || getTicketWorkflowStatus(ticket) === newStatus) return;
 
     onStatusChange(ticketId, newStatus, ticket);
   };

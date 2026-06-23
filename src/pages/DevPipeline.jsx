@@ -15,9 +15,13 @@ import {
   getPlannedEffortHours,
   getTicketWorkflowStatus,
   isClosedStatus,
+  isSchedulableTicket,
+  isTicketBlocked,
+  isTicketClosed,
   normalizeTicketStatus,
 } from "../components/shared/priorityUtils";
 import { useCurrentUser } from "../components/shared/useCurrentUser";
+import usePersistedState from "../components/shared/usePersistedState";
 import moment from "moment";
 import { cn } from "@/lib/utils";
 import {
@@ -388,6 +392,7 @@ export function getDynamicRebalanceOptions(overrides = {}) {
     freezeCurrentWeekSegments: false,
     preserveTodaySegments: false,
     preserveWorkingDaysFromToday: 3,
+    preserveExistingSequence: true,
     ...overrides,
   });
 }
@@ -798,6 +803,7 @@ function getSequenceSortValue(ticket, anchorDate = "", anchorStart = null) {
 
   if (!firstRelevantSegment) {
     return {
+      hasSchedule: false,
       date: "9999-12-31",
       start: Number.POSITIVE_INFINITY,
       created: Date.parse(ticket?.created_date || "") || Number.POSITIVE_INFINITY,
@@ -805,6 +811,7 @@ function getSequenceSortValue(ticket, anchorDate = "", anchorStart = null) {
   }
 
   return {
+    hasSchedule: true,
     date: String(firstRelevantSegment.date || "9999-12-31"),
     start: Number(firstRelevantSegment.start),
     created: Date.parse(ticket?.created_date || "") || Number.POSITIVE_INFINITY,
@@ -928,6 +935,35 @@ function scheduleChanged(ticket, nextSchedule) {
   return JSON.stringify(current) !== JSON.stringify(next);
 }
 
+function getFirstSchedulePoint(source) {
+  const firstSegment = sortSegments(getAllTicketSegments(source))[0];
+  if (!firstSegment) return null;
+  return {
+    date: String(firstSegment.date || ""),
+    start: Number(firstSegment.start),
+  };
+}
+
+function compareSchedulePoint(a, b) {
+  if (!a || !b) return 0;
+  if (a.date !== b.date) return a.date.localeCompare(b.date);
+  return a.start - b.start;
+}
+
+function buildScheduleSlipMetadata(ticket, nextSchedule) {
+  const currentPoint = getFirstSchedulePoint(ticket);
+  const nextPoint = getFirstSchedulePoint(nextSchedule);
+  if (!currentPoint || !nextPoint) return {};
+  if (compareSchedulePoint(currentPoint, nextPoint) >= 0) return {};
+
+  return {
+    schedule_slip_count: (Number(ticket?.schedule_slip_count) || 0) + 1,
+    last_schedule_slipped_at: new Date().toISOString(),
+    last_schedule_slip_from: `${currentPoint.date} ${decimalToTime(currentPoint.start)}`,
+    last_schedule_slip_to: `${nextPoint.date} ${decimalToTime(nextPoint.start)}`,
+  };
+}
+
 // Convert decimal hour to % position within visual window (08:30-18:30)
 function hourToPercent(dec) {
   return ((dec - DAY_VIEW_START) / DAY_VIEW_HOURS) * 100;
@@ -1004,6 +1040,8 @@ function buildTimeSchedule(devTickets, days, dev) {
   days.forEach(d => { dayCursor[d.format("YYYY-MM-DD")] = DAY_START; });
 
   sorted.forEach(ticket => {
+    if (isTicketBlocked(ticket)) return;
+
     const effort = roundHalf(getTicketEffort(ticket) || 4);
     const hasExplicitTimes = ticket.scheduled_date && ticket.start_time && ticket.end_time;
     const normalizedStatus = normalizeTicketStatus(ticket.status);
@@ -1181,7 +1219,7 @@ export function checkScheduleConflict(
     t.assignee_id === devId && 
     t.scheduled_date === scheduledDate && 
     t.id !== ticketId &&
-    !isClosedStatus(t.status) &&
+    isSchedulableTicket(t) &&
     t.start_time && t.end_time
   );
 
@@ -1247,7 +1285,7 @@ export function findOptimalSchedule(allTickets, devId, effortHours, dailyCapacit
   // Build existing schedule by date
   const dateSchedule = {}; // date -> [{ start, end }]
   allTickets
-    .filter((t) => t.assignee_id === devId && !isClosedStatus(t.status))
+    .filter((t) => t.assignee_id === devId && isSchedulableTicket(t))
     .forEach(t => {
       if (t.scheduled_date && t.start_time && t.end_time) {
         if (!dateSchedule[t.scheduled_date]) dateSchedule[t.scheduled_date] = [];
@@ -1366,7 +1404,7 @@ export function buildWeeklyRebalanceUpdates(
   const forceLastTicketSet = new Set((forceLastTicketIds || []).filter(Boolean));
 
   const devTickets = (allTickets || []).filter(
-    (ticket) => ticket.assignee_id === devId && !isClosedStatus(ticket.status)
+    (ticket) => ticket.assignee_id === devId && isSchedulableTicket(ticket)
   );
 
   if (devTickets.length === 0) return [];
@@ -1527,6 +1565,20 @@ export function buildWeeklyRebalanceUpdates(
       const sequenceA = getSequenceSortValue(a, anchorDate, anchorStart);
       const sequenceB = getSequenceSortValue(b, anchorDate, anchorStart);
 
+      if (sequenceA.hasSchedule !== sequenceB.hasSchedule) {
+        return sequenceA.hasSchedule ? -1 : 1;
+      }
+
+      if (!sequenceA.hasSchedule && !sequenceB.hasSchedule) {
+        const priorityA = getEffectivePriorityScore(a);
+        const priorityB = getEffectivePriorityScore(b);
+        if (priorityB !== priorityA) return priorityB - priorityA;
+
+        const deadlineA = getDeadlineSortValue(a);
+        const deadlineB = getDeadlineSortValue(b);
+        if (deadlineA !== deadlineB) return deadlineA - deadlineB;
+      }
+
       if (sequenceA.date !== sequenceB.date) return sequenceA.date.localeCompare(sequenceB.date);
       if (sequenceA.start !== sequenceB.start) return sequenceA.start - sequenceB.start;
       if (sequenceA.created !== sequenceB.created) return sequenceA.created - sequenceB.created;
@@ -1582,7 +1634,10 @@ export function buildWeeklyRebalanceUpdates(
 
     updates.push({
       id: ticket.id,
-      updates: nextSchedule,
+      updates: {
+        ...nextSchedule,
+        ...buildScheduleSlipMetadata(ticket, nextSchedule),
+      },
     });
   });
 
@@ -1601,7 +1656,7 @@ export function buildVisibleWeekCompactionUpdates(
   const weekEnd = weekStart.clone().add(weekDays - 1, "day");
 
   const devTickets = (allTickets || []).filter(
-    (ticket) => ticket.assignee_id === devId && !isClosedStatus(ticket.status)
+    (ticket) => ticket.assignee_id === devId && isSchedulableTicket(ticket)
   );
   if (devTickets.length === 0) return [];
 
@@ -1738,12 +1793,11 @@ export function buildVisibleWeekCompactionUpdates(
 
 export default function DevPipeline() {
   const [searchParams] = useSearchParams();
-  const [weekOffset, setWeekOffset] = useState(0);
+  const [weekOffset, setWeekOffset] = usePersistedState("dev-pipeline:weekOffset", 0);
   const [currentTime, setCurrentTime] = useState(getCurrentTimeDecimal());
-  const [activeDeveloperId, setActiveDeveloperId] = useState("");
+  const [activeDeveloperId, setActiveDeveloperId] = usePersistedState("dev-pipeline:activeDeveloperId", "");
   const [pendingRequestedDeveloperId, setPendingRequestedDeveloperId] = useState(() => searchParams.get("dev") || "");
-  const [selectedClientIds, setSelectedClientIds] = useState([]);
-  const [clientFilterInitialized, setClientFilterInitialized] = useState(false);
+  const [selectedClientIds, setSelectedClientIds] = usePersistedState("dev-pipeline:selectedClientIds", null);
   const queryClient = useQueryClient();
   const { user, isTechSupervisor, isAdmin, isAnalyst } = useCurrentUser();
 
@@ -1887,6 +1941,17 @@ export default function DevPipeline() {
       return;
     }
 
+    if (
+      pendingRequestedDeveloperId &&
+      activeDevs.some((dev) => dev.id === pendingRequestedDeveloperId)
+    ) {
+      if (activeDeveloperId !== pendingRequestedDeveloperId) {
+        setActiveDeveloperId(pendingRequestedDeveloperId);
+      }
+      setPendingRequestedDeveloperId("");
+      return;
+    }
+
     const hasCurrentSelection = activeDevs.some((dev) => dev.id === activeDeveloperId);
     if (hasCurrentSelection) {
       if (pendingRequestedDeveloperId) {
@@ -1914,24 +1979,24 @@ export default function DevPipeline() {
 
   useEffect(() => {
     if (clientFilterOptions.length === 0) {
-      setSelectedClientIds((prev) => (prev.length === 0 ? prev : []));
       return;
     }
 
     const availableIds = clientFilterOptions.map((client) => client.id);
-    if (!clientFilterInitialized) {
-      setSelectedClientIds((prev) => (areStringArraysEqual(prev, availableIds) ? prev : availableIds));
-      setClientFilterInitialized(true);
+    if (!Array.isArray(selectedClientIds) || selectedClientIds.length === 0) {
+      setSelectedClientIds(availableIds);
       return;
     }
 
     setSelectedClientIds((prev) => {
-      const next = prev.filter((id) => availableIds.includes(id));
-      return areStringArraysEqual(next, prev) ? prev : next;
+      const current = Array.isArray(prev) ? prev : availableIds;
+      const next = current.filter((id) => availableIds.includes(id));
+      return areStringArraysEqual(next, current) ? current : next;
     });
-  }, [clientFilterOptions, clientFilterInitialized]);
+  }, [clientFilterOptions, selectedClientIds, setSelectedClientIds]);
 
-  const selectedClientIdSet = useMemo(() => new Set(selectedClientIds), [selectedClientIds]);
+  const selectedClientList = Array.isArray(selectedClientIds) ? selectedClientIds : [];
+  const selectedClientIdSet = useMemo(() => new Set(selectedClientList), [selectedClientList]);
   const activeDeveloper = useMemo(
     () => activeDevs.find((dev) => dev.id === activeDeveloperId) || null,
     [activeDevs, activeDeveloperId]
@@ -1951,11 +2016,12 @@ export default function DevPipeline() {
   }, [tickets, selectedClientIdSet, clientsById, clientsByName]);
 
   const toggleClientFilter = (clientId) => {
-    setSelectedClientIds((prev) => (
-      prev.includes(clientId)
-        ? prev.filter((id) => id !== clientId)
-        : [...prev, clientId]
-    ));
+    setSelectedClientIds((prev) => {
+      const current = Array.isArray(prev) ? prev : [];
+      return current.includes(clientId)
+        ? current.filter((id) => id !== clientId)
+        : [...current, clientId];
+    });
   };
 
   // Hour labels for the time axis
@@ -2140,7 +2206,7 @@ export default function DevPipeline() {
               <PopoverTrigger asChild>
                 <Button variant="outline" className="h-7 rounded-full px-3 text-xs font-semibold">
                   <SlidersHorizontal className="mr-1.5 h-3.5 w-3.5" />
-                  Clienti {selectedClientIds.length}/{clientFilterOptions.length || 0}
+                  Clienti {selectedClientList.length}/{clientFilterOptions.length || 0}
                 </Button>
               </PopoverTrigger>
               <PopoverContent align="end" className="w-[300px] rounded-2xl border-border/70 bg-card/95 p-3 shadow-[var(--shadow-hover)]">
@@ -2157,9 +2223,9 @@ export default function DevPipeline() {
                     <button
                       type="button"
                       className="rounded-md px-2 py-1 text-[10px] font-semibold text-muted-foreground hover:bg-muted/60 hover:text-foreground"
-                      onClick={() => setSelectedClientIds([])}
+                      onClick={() => setSelectedClientIds(clientFilterOptions.map((client) => client.id))}
                     >
-                      Nessuno
+                      Reset
                     </button>
                   </div>
                 </div>
@@ -2502,7 +2568,7 @@ export default function DevPipeline() {
                         key: `${ticket.id}-${dateStr}-${isContinuation ? "cont" : "main"}-${idx}`,
                         start: Number(startHour),
                         end: Number(endHour),
-                        layoutKind: isClosedStatus(ticket.status) ? "closed" : "active",
+                        layoutKind: isTicketClosed(ticket) ? "closed" : "active",
                       })),
                     ]);
                     const isToday = day.isSame(today, "day");
@@ -2681,7 +2747,7 @@ function TicketBlock({
   const status = STATUS_CONFIG[normalizedStatus] || STATUS_CONFIG.new;
   const isDeadlineSoon = ticket.deadline && moment(ticket.deadline).diff(moment(), "days") <= 2;
   const isDeadlinePast = ticket.deadline && moment(ticket.deadline).isBefore(moment());
-  const isDone = isClosedStatus(ticket.status);
+  const isDone = isTicketClosed(ticket);
   const isPast = moment(dateStr).isBefore(moment(), "day");
 
   const topPercent = hourToPercent(startHour);

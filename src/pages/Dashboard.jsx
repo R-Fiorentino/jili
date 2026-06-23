@@ -1,9 +1,17 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo } from "react";
 import { appClient } from "@/api/appClient";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { LayoutGrid, List, Users, Ticket, Clock, Search, CheckCircle2, Zap } from "lucide-react";
-import { compareTicketsByPriority, getEffectivePriorityScore, isClosedStatus, normalizeTicketStatus } from "../components/shared/priorityUtils";
+import {
+  compareTicketsByPriority,
+  getEffectivePriorityScore,
+  getTicketWorkflowStatus,
+  isClosedStatus,
+  isSchedulableTicket,
+  isTicketClosed,
+  normalizeTicketStatus,
+} from "../components/shared/priorityUtils";
 
 import BacklogTable from "../components/dashboard/BacklogTable";
 import KanbanBoard from "../components/pipeline/KanbanBoard";
@@ -11,6 +19,7 @@ import CapacityBoard from "../components/capacity/CapacityBoard";
 import { buildWeeklyRebalanceUpdates, getDynamicRebalanceOptions } from "./DevPipeline";
 import moment from "moment";
 import { useCurrentUser } from "../components/shared/useCurrentUser";
+import usePersistedState from "../components/shared/usePersistedState";
 
 const DAY_END = 18;
 
@@ -211,7 +220,7 @@ function SummaryChip({ icon: Icon, label, value }) {
 }
 
 export default function Dashboard() {
-  const [activeTab, setActiveTab] = useState("kanban");
+  const [activeTab, setActiveTab] = usePersistedState("dashboard:activeTab", "kanban");
   const queryClient = useQueryClient();
   const { isAdmin } = useCurrentUser();
 
@@ -234,22 +243,21 @@ export default function Dashboard() {
   });
 
   const dashboardMetrics = useMemo(() => {
-    const openTickets = tickets.filter((t) => !isClosedStatus(t.status)).length;
-    const inProgress = tickets.filter((t) => normalizeTicketStatus(t.status) === "in_progress").length;
-    const qaReview = tickets.filter((t) => normalizeTicketStatus(t.status) === "qa_review").length;
+    const openTickets = tickets.filter((t) => !isTicketClosed(t)).length;
+    const inProgress = tickets.filter((t) => getTicketWorkflowStatus(t) === "in_progress").length;
+    const qaReview = tickets.filter((t) => getTicketWorkflowStatus(t) === "qa_review").length;
     const doneThisWeek = tickets.filter((t) => {
-      if (!isClosedStatus(t.status)) return false;
+      if (!isTicketClosed(t)) return false;
       const updated = new Date(t.updated_date);
       const weekAgo = new Date();
       weekAgo.setDate(weekAgo.getDate() - 7);
       return updated >= weekAgo;
     }).length;
 
-    const avgScore = openTickets > 0
+    const schedulableTickets = tickets.filter((t) => isSchedulableTicket(t));
+    const avgScore = schedulableTickets.length > 0
       ? Math.round(
-          tickets
-            .filter((t) => !isClosedStatus(t.status))
-            .reduce((sum, t) => sum + getEffectivePriorityScore(t), 0) / openTickets
+          schedulableTickets.reduce((sum, t) => sum + getEffectivePriorityScore(t), 0) / schedulableTickets.length
         )
       : 0;
 
@@ -301,6 +309,14 @@ export default function Dashboard() {
 
     await appClient.entities.Ticket.update(ticketId, {
       status: newStatus,
+      ...(newStatus === "blocked"
+        ? {
+            scheduled_date: null,
+            start_time: null,
+            end_time: null,
+            continuation_schedule: [],
+          }
+        : {}),
       ...(doneSnapshot || doneFallback),
       audit_log: [...(ticket.audit_log || []), auditEntry],
     });
