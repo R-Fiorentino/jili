@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { appClient } from "@/api/appClient";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -1798,6 +1798,7 @@ export default function DevPipeline() {
   const [activeDeveloperId, setActiveDeveloperId] = usePersistedState("dev-pipeline:activeDeveloperId", "");
   const [pendingRequestedDeveloperId, setPendingRequestedDeveloperId] = useState(() => searchParams.get("dev") || "");
   const [selectedClientIds, setSelectedClientIds] = usePersistedState("dev-pipeline:selectedClientIds", null);
+  const staleRebalanceSignatureRef = useRef("");
   const queryClient = useQueryClient();
   const { user, isTechSupervisor, isAdmin, isAnalyst } = useCurrentUser();
 
@@ -1902,6 +1903,75 @@ export default function DevPipeline() {
     () => (canViewAllPipelines ? activeDevs : loggedDeveloper ? [loggedDeveloper] : []),
     [activeDevs, canViewAllPipelines, loggedDeveloper]
   );
+
+  useEffect(() => {
+    if (selectableDevelopers.length === 0 || tickets.length === 0) return;
+
+    const todayStr = moment().format("YYYY-MM-DD");
+    const developerById = new Map(selectableDevelopers.map((dev) => [dev.id, dev]));
+    const staleTickets = tickets
+      .filter((ticket) => {
+        if (!ticket?.assignee_id || !developerById.has(ticket.assignee_id)) return false;
+        if (!ticket.scheduled_date || String(ticket.scheduled_date) >= todayStr) return false;
+        if (!isSchedulableTicket(ticket)) return false;
+        if (normalizeTicketStatus(ticket.status) === "in_progress") return false;
+        return getTicketEffort(ticket) > 0;
+      })
+      .sort((a, b) => String(a.id || "").localeCompare(String(b.id || "")));
+
+    if (staleTickets.length === 0) return;
+
+    const staleDeveloperIds = [...new Set(staleTickets.map((ticket) => ticket.assignee_id).filter(Boolean))];
+    const signature = `${todayStr}:${staleTickets.map((ticket) => ticket.id).join(",")}`;
+    if (staleRebalanceSignatureRef.current === signature) return;
+    staleRebalanceSignatureRef.current = signature;
+
+    let cancelled = false;
+
+    const rebalanceStaleTickets = async () => {
+      let movedCount = 0;
+
+      for (const developerId of staleDeveloperIds) {
+        const dev = developerById.get(developerId) || null;
+        const latestTickets = await appClient.entities.Ticket.list();
+        const updates = buildWeeklyRebalanceUpdates(
+          latestTickets,
+          developerId,
+          dev,
+          getDynamicRebalanceOptions({
+            planningStartDate: todayStr,
+            includeTodayHoles: true,
+            preserveTodaySegments: false,
+            preserveWorkingDaysFromToday: 3,
+            preserveExistingSequence: true,
+          })
+        );
+
+        if (updates.length === 0) continue;
+        movedCount += updates.length;
+        await Promise.all(
+          updates.map((entry) => appClient.entities.Ticket.update(entry.id, entry.updates))
+        );
+      }
+
+      if (movedCount > 0 && !cancelled) {
+        await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+        toast({
+          title: "Pipeline riallineata",
+          description: `${movedCount} ticket arretrati ripianificati da oggi in avanti.`,
+        });
+      }
+    };
+
+    rebalanceStaleTickets().catch(() => {
+      staleRebalanceSignatureRef.current = "";
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [queryClient, selectableDevelopers, tickets]);
+
   const clientFilterOptions = useMemo(() => {
     const optionMap = new Map();
 

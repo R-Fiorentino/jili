@@ -4840,6 +4840,31 @@ export default function TicketDetail() {
                       </div>
                     </div>
                   </div>
+                  {isPostPreviewChangeTicket && mainTicketRecord && mainTicketRecord.id !== ticket.id && (
+                    <div className="space-y-2">
+                      <p className={sectionEyebrowClass}>Collegamento ticket</p>
+                      <div className="rounded-2xl border border-amber-200/80 bg-amber-50/80 p-5 dark:border-amber-500/30 dark:bg-amber-500/10">
+                        <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_180px]">
+                          <div className="min-w-0">
+                            <p className={sidebarLabelClass}>Ticket principale</p>
+                            <Link
+                              to={buildTicketUrl(mainTicketRecord.id)}
+                              className="mt-2 inline-flex max-w-full text-sm font-semibold text-primary hover:underline"
+                            >
+                              <span className="truncate">{mainTicketRecord.title}</span>
+                            </Link>
+                            <p className="mt-2 text-xs leading-5 text-amber-900/80 dark:text-amber-100/80">
+                              Questa task e collegata alla richiesta originale: usa il ticket principale per recuperare brief, contesto e stato del test.
+                            </p>
+                          </div>
+                          <div className="rounded-2xl bg-background/80 px-4 py-3">
+                            <p className={sidebarLabelClass}>Tipo task</p>
+                            <p className="mt-1 text-sm font-semibold text-foreground">Modifica post-preview</p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                   {(reviewPreviewSource?.qa_preview_url || reviewPreviewSource?.qa_review_notes || reviewPreviewSource?.qa_test_instructions || isQaReviewTicket) && (
                     <div className="space-y-2">
                       <p className={sectionEyebrowClass}>QA / Review</p>

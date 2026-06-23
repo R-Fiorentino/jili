@@ -27,6 +27,38 @@ import { createTicketDetailUrl } from "@/utils";
 import { Check, Clock, Search, ArrowUpDown, SlidersHorizontal, X } from "lucide-react";
 import moment from "moment";
 
+const LIVE_STATE_CONFIG = {
+  not_live: {
+    label: "Non live",
+    color: "bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-500/15 dark:text-slate-200 dark:border-slate-500/35",
+  },
+  launch_requested: {
+    label: "Live richiesta",
+    color: "bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-500/15 dark:text-amber-300 dark:border-amber-500/35",
+  },
+  live: {
+    label: "Live",
+    color: "bg-emerald-100 text-emerald-700 border-emerald-200 dark:bg-emerald-500/15 dark:text-emerald-300 dark:border-emerald-500/35",
+  },
+  change_requested: {
+    label: "Modifica richiesta",
+    color: "bg-indigo-100 text-indigo-700 border-indigo-200 dark:bg-indigo-500/15 dark:text-indigo-300 dark:border-indigo-500/35",
+  },
+  stop_requested: {
+    label: "Spegnimento richiesto",
+    color: "bg-rose-100 text-rose-700 border-rose-200 dark:bg-rose-500/15 dark:text-rose-300 dark:border-rose-500/35",
+  },
+  stopped: {
+    label: "Spento",
+    color: "bg-zinc-100 text-zinc-700 border-zinc-200 dark:bg-zinc-500/15 dark:text-zinc-200 dark:border-zinc-500/35",
+  },
+};
+
+function normalizeLiveState(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return LIVE_STATE_CONFIG[normalized] ? normalized : "not_live";
+}
+
 export default function BacklogTable({
   tickets,
   clients,
@@ -36,6 +68,7 @@ export default function BacklogTable({
   showTypeColumn = true,
   showPlanningStartColumn = false,
   showDifficultyFilter = true,
+  showLiveStateFilter = false,
   defaultSortField,
   defaultSortDir,
   detailFromPage = "dashboard",
@@ -55,6 +88,7 @@ export default function BacklogTable({
     }
   });
   const [filterDifficulty, setFilterDifficulty] = usePersistedState(`${persistenceKey}:difficulty`, "all");
+  const [filterLiveState, setFilterLiveState] = usePersistedState(`${persistenceKey}:liveState`, "all");
   const [sortField, setSortField] = usePersistedState(
     `${persistenceKey}:sortField`,
     () => defaultSortField || (showPriorityScore ? "priority_score" : "created_date")
@@ -107,6 +141,7 @@ export default function BacklogTable({
       if (filterClient !== "all" && t.client_id !== filterClient) return false;
       if (selectedStatusSet.size > 0 && !selectedStatusSet.has(getTicketWorkflowStatus(t))) return false;
       if (showDifficultyFilter && filterDifficulty !== "all" && t.difficulty !== filterDifficulty) return false;
+      if (showLiveStateFilter && filterLiveState !== "all" && normalizeLiveState(t.live_state) !== filterLiveState) return false;
       return true;
     })
     .sort((a, b) => {
@@ -242,6 +277,21 @@ export default function BacklogTable({
                 </SelectContent>
               </Select>
             )}
+            {showLiveStateFilter && (
+              <Select value={filterLiveState} onValueChange={setFilterLiveState}>
+                <SelectTrigger className="h-10 w-44 bg-muted/55 text-sm">
+                  <SelectValue placeholder="Stato live" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">Tutti live/non live</SelectItem>
+                  {Object.entries(LIVE_STATE_CONFIG).map(([key, value]) => (
+                    <SelectItem key={key} value={key}>
+                      {value.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
           </div>
         </div>
       </div>
@@ -294,6 +344,7 @@ export default function BacklogTable({
               const actualEffort = getActualEffortHours(ticket);
               const ticketBlocked = isTicketBlocked(ticket);
               const scheduleSlipCount = Number(ticket.schedule_slip_count) || 0;
+              const liveState = LIVE_STATE_CONFIG[normalizeLiveState(ticket.live_state)] || LIVE_STATE_CONFIG.not_live;
               return (
                 <TableRow key={ticket.id} className="group cursor-pointer hover:bg-muted/30">
                   <TableCell>
@@ -316,6 +367,11 @@ export default function BacklogTable({
                         {scheduleSlipCount > 0 ? (
                           <Badge variant="outline" className="border-amber-200 bg-amber-50 px-1.5 py-0 text-[10px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/15 dark:text-amber-300">
                             Slittato {scheduleSlipCount}x
+                          </Badge>
+                        ) : null}
+                        {showLiveStateFilter ? (
+                          <Badge variant="outline" className={`${liveState.color} px-1.5 py-0 text-[10px]`}>
+                            {liveState.label}
                           </Badge>
                         ) : null}
                       </div>

@@ -376,6 +376,7 @@ export default function MyTickets() {
           showTypeColumn={false}
           showPlanningStartColumn
           showDifficultyFilter={false}
+          showLiveStateFilter
           defaultSortField="planning_start"
           defaultSortDir={1}
           detailFromPage="my_tickets"
