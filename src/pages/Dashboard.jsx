@@ -17,10 +17,11 @@ import {
 import BacklogTable from "../components/dashboard/BacklogTable";
 import KanbanBoard from "../components/pipeline/KanbanBoard";
 import CapacityBoard from "../components/capacity/CapacityBoard";
-import { buildWeeklyRebalanceUpdates, getDynamicRebalanceOptions } from "./DevPipeline";
+import { buildWeeklyRebalanceUpdates, checkScheduleConflict, getDynamicRebalanceOptions } from "./DevPipeline";
 import moment from "moment";
 import { useCurrentUser } from "../components/shared/useCurrentUser";
 import usePersistedState from "../components/shared/usePersistedState";
+import { toast } from "@/components/ui/use-toast";
 
 const DAY_END = 18;
 
@@ -337,6 +338,39 @@ export default function Dashboard() {
         continuation_schedule: [],
         ...(rawEffort && rawEffort > 0 ? { effort_hours: rawEffort } : {}),
       };
+    }
+
+    if (newStatus === "in_progress" && ticket.assignee_id) {
+      const candidateSegments = getTicketSegments({ ...ticket, status: newStatus });
+      if (candidateSegments.length > 0) {
+        const latestTickets = await appClient.entities.Ticket.list();
+        const dev = developers.find((d) => d.id === ticket.assignee_id) || null;
+
+        for (const segment of candidateSegments) {
+          const conflict = checkScheduleConflict(
+            latestTickets,
+            ticket.assignee_id,
+            getEffectivePriorityScore(ticket),
+            segment.date,
+            decimalToTime(segment.start),
+            decimalToTime(segment.end),
+            ticketId,
+            dev
+          );
+
+          if (conflict.status !== "ok") {
+            const suggestion = conflict.suggestedSchedule
+              ? ` Slot libero suggerito: ${conflict.suggestedSchedule.date} ${conflict.suggestedSchedule.start_time}-${conflict.suggestedSchedule.end_time}.`
+              : "";
+            toast({
+              variant: "destructive",
+              title: "Slot gia occupato",
+              description: `${conflict.message}${suggestion}`,
+            });
+            return;
+          }
+        }
+      }
     }
 
     await appClient.entities.Ticket.update(ticketId, {

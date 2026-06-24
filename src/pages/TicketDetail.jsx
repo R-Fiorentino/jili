@@ -34,6 +34,7 @@ import {
 } from "../components/shared/priorityUtils";
 import {
   buildWeeklyRebalanceUpdates,
+  checkScheduleConflict,
   findOptimalSchedule,
   getDynamicRebalanceOptions,
   getDeveloperUnavailableIntervalsByDate,
@@ -126,6 +127,62 @@ function normalizeCommentMarkdown(text = "") {
       return `<${url}>${trailing}`;
     })
     .join("");
+}
+
+function normalizeQaPreviewEntries(previewEntries = [], fallbackUrls = [], fallbackLink = "") {
+  const rawEntries = Array.isArray(previewEntries) ? previewEntries : [previewEntries];
+  const rawFallbackUrls = Array.isArray(fallbackUrls) ? fallbackUrls : [fallbackUrls];
+  const candidates = [
+    ...rawEntries.map((entry) =>
+      typeof entry === "object" && entry !== null
+        ? {
+            title: String(entry.title || entry.label || "").trim(),
+            url: String(entry.url || entry.link || "").trim(),
+          }
+        : { title: "", url: String(entry || "").trim() }
+    ),
+    ...rawFallbackUrls.map((url) => ({ title: "", url: String(url || "").trim() })),
+    { title: "", url: String(fallbackLink || "").trim() },
+  ].filter((entry) => entry.url);
+
+  const byUrl = new Map();
+  candidates.forEach((entry) => {
+    const existing = byUrl.get(entry.url);
+    if (!existing || (!existing.title && entry.title)) {
+      byUrl.set(entry.url, entry);
+    }
+  });
+
+  return [...byUrl.values()].map((entry, index) => ({
+    title: entry.title || `Preview ${index + 1}`,
+    url: entry.url,
+  }));
+}
+
+function resolveQaPreviewEntries(...tickets) {
+  for (const currentTicket of tickets) {
+    const entries = normalizeQaPreviewEntries(
+      currentTicket?.qa_preview_links,
+      currentTicket?.qa_preview_urls,
+      currentTicket?.qa_preview_url
+    );
+    if (entries.length > 0) return entries;
+  }
+  return [];
+}
+
+function buildQaPreviewPayload(previewEntries = [], fallbackUrls = [], fallbackLink = "") {
+  const normalizedEntries = normalizeQaPreviewEntries(
+    previewEntries,
+    fallbackUrls,
+    fallbackLink
+  );
+  const normalizedUrls = normalizedEntries.map((entry) => entry.url);
+  return {
+    qa_preview_links: normalizedEntries,
+    qa_preview_urls: normalizedUrls,
+    qa_preview_url: normalizedUrls[0] || "",
+  };
 }
 
 function extractMentionedUserTokens(text = "") {
@@ -819,7 +876,7 @@ export default function TicketDetail() {
   const [manualPriorityInput, setManualPriorityInput] = useState("");
   const [qaRequestDialog, setQaRequestDialog] = useState(false);
   const [qaRequestForm, setQaRequestForm] = useState({
-    preview_url: "",
+    preview_links: [{ title: "", url: "" }],
     review_notes: "",
     test_instructions: "",
   });
@@ -947,6 +1004,7 @@ export default function TicketDetail() {
     return ticket;
   }, [ticket, ticketKind, tickets, mainTicketRecord]);
   const reviewPreviewSource = ticketKind === "qa_review" ? qaSourceTicketRecord : ticket;
+  const reviewPreviewLinks = resolveQaPreviewEntries(reviewPreviewSource);
   const hasQaSidebarMeta = Boolean(
     (mainTicketRecord && mainTicketRecord.id !== ticket?.id) ||
     (isQaReviewTicket && qaSourceTicketRecord && qaSourceTicketRecord.id !== mainTicketRecord?.id) ||
@@ -1343,7 +1401,11 @@ export default function TicketDetail() {
       parent_ticket_id: parentTicket.id,
       qa_source_ticket_id: sourceTicket.id,
       qa_cycle: qaCycle,
-      qa_preview_url: qaPayload.preview_url,
+      ...buildQaPreviewPayload(
+        qaPayload.preview_links,
+        qaPayload.preview_urls,
+        qaPayload.preview_url
+      ),
       qa_review_notes: qaPayload.review_notes,
       qa_test_instructions: qaPayload.test_instructions,
       qa_requested_at: new Date().toISOString(),
@@ -1393,6 +1455,9 @@ export default function TicketDetail() {
     const referencePayload = buildReferenceLinksPayload(
       normalizeReferenceLinks(sourceTicket.reference_links, sourceTicket.link)
     );
+    const previewPayload = buildQaPreviewPayload(
+      resolveQaPreviewEntries(sourceTicket, parentTicket)
+    );
 
     const createdFixTicket = await appClient.entities.Ticket.create({
       title: `[QA Fix] ${parentTicket.title}`,
@@ -1414,7 +1479,7 @@ export default function TicketDetail() {
       parent_ticket_id: parentTicket.id,
       qa_source_ticket_id: sourceTicket.id,
       qa_cycle: qaCycle,
-      qa_preview_url: sourceTicket.qa_preview_url || parentTicket.qa_preview_url || "",
+      ...previewPayload,
       qa_review_notes: sourceTicket.qa_review_notes || parentTicket.qa_review_notes || "",
       qa_test_instructions: sourceTicket.qa_test_instructions || parentTicket.qa_test_instructions || "",
       qa_reject_notes: rejectNotes,
@@ -1474,6 +1539,7 @@ export default function TicketDetail() {
     const referencePayload = buildReferenceLinksPayload(
       normalizeReferenceLinks(parentTicket.reference_links, parentTicket.link)
     );
+    const previewPayload = buildQaPreviewPayload(resolveQaPreviewEntries(parentTicket));
     const nowIso = new Date().toISOString();
 
     const createdChangeTicket = await appClient.entities.Ticket.create({
@@ -1494,7 +1560,7 @@ export default function TicketDetail() {
       priority_override: POST_PREVIEW_SYSTEM_PRIORITY,
       ticket_kind: "post_preview_change",
       parent_ticket_id: parentTicket.id,
-      qa_preview_url: parentTicket.qa_preview_url || "",
+      ...previewPayload,
       qa_review_notes: parentTicket.qa_review_notes || "",
       qa_test_instructions: parentTicket.qa_test_instructions || "",
       post_preview_notes: changeNotes,
@@ -1536,11 +1602,16 @@ export default function TicketDetail() {
   }) => {
     const sourceTicket = qaSourceTicketRecord || ticket;
     const parentTicket = mainTicketRecord || sourceTicket;
+    const previewPayload = buildQaPreviewPayload(
+      qaPayload.preview_links,
+      qaPayload.preview_urls,
+      qaPayload.preview_url
+    );
 
     await finalizeStatusChange("qa_review", {
       ...statusOptions,
       extraData: {
-        qa_preview_url: qaPayload.preview_url,
+        ...previewPayload,
         qa_review_notes: qaPayload.review_notes,
         qa_test_instructions: qaPayload.test_instructions,
         qa_cycle: resolveQaCycle(sourceTicket, parentTicket),
@@ -1556,7 +1627,7 @@ export default function TicketDetail() {
       {
         ...sourceTicket,
         status: "qa_review",
-        qa_preview_url: qaPayload.preview_url,
+        ...previewPayload,
         qa_review_notes: qaPayload.review_notes,
         qa_test_instructions: qaPayload.test_instructions,
       };
@@ -1568,7 +1639,7 @@ export default function TicketDetail() {
         refreshedParent.id,
         {
           status: "qa_review",
-          qa_preview_url: qaPayload.preview_url,
+          ...previewPayload,
           qa_review_notes: qaPayload.review_notes,
           qa_test_instructions: qaPayload.test_instructions,
           qa_cycle: resolveQaCycle(refreshedSource, refreshedParent),
@@ -1617,13 +1688,16 @@ export default function TicketDetail() {
       latestTickets.find((entry) => entry.id === sourceTicket.id) || sourceTicket;
     const refreshedParent =
       latestTickets.find((entry) => entry.id === parentTicket.id) || parentTicket;
+    const previewPayload = buildQaPreviewPayload(
+      resolveQaPreviewEntries(refreshedFix, refreshedParent)
+    );
 
     await updateTicketWithAudit(
       refreshedParent.id,
       {
         status: "qa_review",
         qa_cycle: nextQaCycle,
-        qa_preview_url: refreshedFix.qa_preview_url || refreshedParent.qa_preview_url || "",
+        ...previewPayload,
         qa_review_notes: refreshedFix.qa_review_notes || refreshedParent.qa_review_notes || "",
         qa_test_instructions:
           refreshedFix.qa_test_instructions || refreshedParent.qa_test_instructions || "",
@@ -1637,7 +1711,9 @@ export default function TicketDetail() {
       sourceTicket: refreshedFix,
       parentTicket: refreshedParent,
       qaPayload: {
-        preview_url: refreshedFix.qa_preview_url || refreshedParent.qa_preview_url || "",
+        preview_links: previewPayload.qa_preview_links,
+        preview_urls: previewPayload.qa_preview_urls,
+        preview_url: previewPayload.qa_preview_url,
         review_notes: refreshedFix.qa_review_notes || refreshedParent.qa_review_notes || "",
         test_instructions:
           refreshedFix.qa_test_instructions || refreshedParent.qa_test_instructions || "",
@@ -2388,6 +2464,39 @@ export default function TicketDetail() {
         timeData.end_time = null;
         timeData.continuation_schedule = [];
       }
+
+      const candidateSegments = getTicketScheduleSegments({
+        ...ticket,
+        ...timeData,
+        status: newStatus,
+      });
+      if (candidateSegments.length > 0) {
+        const latestTickets = await appClient.entities.Ticket.list();
+        for (const segment of candidateSegments) {
+          const conflict = checkScheduleConflict(
+            latestTickets,
+            ticket.assignee_id,
+            getEffectivePriorityScore(ticket),
+            segment.date,
+            decimalToTime(segment.start),
+            decimalToTime(segment.end),
+            ticket.id,
+            dev
+          );
+
+          if (conflict.status !== "ok") {
+            const suggestion = conflict.suggestedSchedule
+              ? ` Slot libero suggerito: ${conflict.suggestedSchedule.date} ${conflict.suggestedSchedule.start_time}-${conflict.suggestedSchedule.end_time}.`
+              : "";
+            toast({
+              variant: "destructive",
+              title: "Slot gia occupato",
+              description: `${conflict.message}${suggestion}`,
+            });
+            return;
+          }
+        }
+      }
     }
     if (newStatus === "blocked") {
       timeData.scheduled_date = null;
@@ -2509,6 +2618,28 @@ export default function TicketDetail() {
       return;
     }
 
+    if (newStatus === "in_progress" && ticket.assignee_id) {
+      const anchorStart = timeToDecimal(timeData.start_time);
+      await applyRebalanceForDevelopers([ticket.assignee_id], {
+        freezeTicketIds: [ticket.id],
+        preserveWorkingDaysFromToday: 0,
+        preserveExistingSequence: true,
+        includeTodayHoles: true,
+        freezeCurrentWeekSegments: false,
+        preserveTodaySegments: false,
+        planningStartDate: timeData.scheduled_date || nowInfo.date,
+        ...(Number.isFinite(anchorStart) && timeData.scheduled_date
+          ? {
+              manualInsertionAnchor: {
+                date: timeData.scheduled_date,
+                start: anchorStart,
+              },
+            }
+          : {}),
+      });
+      return;
+    }
+
     const rebalanceOptions = isCompletionStatus && !wasCompletionStatus
       ? (() => {
           if (completionMode === "planned") {
@@ -2569,8 +2700,12 @@ export default function TicketDetail() {
 
   const handleStatusChange = async (newStatus) => {
     if (newStatus === "qa_review" && ticketKind === "main") {
+      const existingPreviewLinks = resolveQaPreviewEntries(ticket);
       setQaRequestForm({
-        preview_url: ticket?.qa_preview_url || "",
+        preview_links:
+          existingPreviewLinks.length > 0
+            ? existingPreviewLinks
+            : [{ title: "", url: "" }],
         review_notes: ticket?.qa_review_notes || "",
         test_instructions: ticket?.qa_test_instructions || "",
       });
@@ -2641,19 +2776,50 @@ export default function TicketDetail() {
     await finalizeStatusChange(newStatus);
   };
 
+  const updateQaRequestPreviewLink = (index, field, value) => {
+    setQaRequestForm((prev) => ({
+      ...prev,
+      preview_links: (prev.preview_links || []).map((link, linkIndex) =>
+        linkIndex === index ? { ...link, [field]: value } : link
+      ),
+    }));
+  };
+
+  const addQaRequestPreviewLink = () => {
+    setQaRequestForm((prev) => ({
+      ...prev,
+      preview_links: [...(prev.preview_links || []), { title: "", url: "" }],
+    }));
+  };
+
+  const removeQaRequestPreviewLink = (index) => {
+    setQaRequestForm((prev) => {
+      const nextLinks = (prev.preview_links || []).filter(
+        (_, linkIndex) => linkIndex !== index
+      );
+      return {
+        ...prev,
+        preview_links:
+          nextLinks.length > 0 ? nextLinks : [{ title: "", url: "" }],
+      };
+    });
+  };
+
   const handleQaRequestSubmit = async () => {
-    const normalizedPreview = String(qaRequestForm.preview_url || "").trim();
-    if (!normalizedPreview) {
+    const normalizedPreviews = normalizeQaPreviewEntries(qaRequestForm.preview_links);
+    if (normalizedPreviews.length === 0) {
       toast({
         variant: "destructive",
         title: "Preview obbligatoria",
-        description: "Inserisci la preview da controllare prima di inviare il ticket in QA.",
+        description: "Inserisci almeno una preview da controllare prima di inviare il ticket in QA.",
       });
       return;
     }
 
     const qaPayload = {
-      preview_url: normalizedPreview,
+      preview_links: normalizedPreviews,
+      preview_urls: normalizedPreviews.map((entry) => entry.url),
+      preview_url: normalizedPreviews[0].url,
       review_notes: String(qaRequestForm.review_notes || "").trim(),
       test_instructions: String(qaRequestForm.test_instructions || "").trim(),
     };
@@ -3904,7 +4070,12 @@ export default function TicketDetail() {
       deadline: ticket.deadline,
       reference_links: normalizeReferenceLinks(ticket.reference_links, ticket.link),
       type: ticket.type,
-      qa_preview_url: ticket.qa_preview_url || "",
+      qa_preview_links: (() => {
+        const previewLinks = resolveQaPreviewEntries(ticket);
+        return previewLinks.length > 0
+          ? previewLinks
+          : [{ title: "", url: "" }];
+      })(),
       qa_review_notes: ticket.qa_review_notes || "",
       qa_test_instructions: ticket.qa_test_instructions || "",
     });
@@ -3935,6 +4106,38 @@ export default function TicketDetail() {
     });
   };
 
+  const updateEditPreviewLink = (index, field, value) => {
+    setEditForm((prev) => ({
+      ...prev,
+      qa_preview_links: (prev.qa_preview_links || []).map((link, linkIndex) =>
+        linkIndex === index ? { ...link, [field]: value } : link
+      ),
+    }));
+  };
+
+  const addEditPreviewLink = () => {
+    setEditForm((prev) => ({
+      ...prev,
+      qa_preview_links: [
+        ...(prev.qa_preview_links || []),
+        { title: "", url: "" },
+      ],
+    }));
+  };
+
+  const removeEditPreviewLink = (index) => {
+    setEditForm((prev) => {
+      const nextLinks = (prev.qa_preview_links || []).filter(
+        (_, linkIndex) => linkIndex !== index
+      );
+      return {
+        ...prev,
+        qa_preview_links:
+          nextLinks.length > 0 ? nextLinks : [{ title: "", url: "" }],
+      };
+    });
+  };
+
   const handleEditSave = async () => {
     const normalizedDescription = String(editForm.description || "").trim();
     if (!normalizedDescription) {
@@ -3948,11 +4151,12 @@ export default function TicketDetail() {
 
     const client = clients.find(c => c.id === ticket.client_id);
     const referencePayload = buildReferenceLinksPayload(editForm.reference_links);
+    const previewPayload = buildQaPreviewPayload(editForm.qa_preview_links);
     const payload = {
       ...editForm,
       description: normalizedDescription,
       required_tracking: String(editForm.required_tracking || "").trim(),
-      qa_preview_url: String(editForm.qa_preview_url || "").trim(),
+      ...previewPayload,
       qa_review_notes: String(editForm.qa_review_notes || "").trim(),
       qa_test_instructions: String(editForm.qa_test_instructions || "").trim(),
       ...referencePayload,
@@ -4000,7 +4204,7 @@ export default function TicketDetail() {
               </div>
             </div>
             <p className="text-xs text-gray-600 mb-4 bg-amber-50 rounded-lg p-3 border border-amber-100">
-              Vuoi spostare l'orario di inizio a <strong>{inProgressConflict.nowTime}</strong>? Questo causerà l'adattamento della pipeline.
+              Puoi usare <strong>{inProgressConflict.nowTime}</strong> solo se lo slot e libero. Se e occupato, la piattaforma blocchera l'avvio.
             </p>
             <div className="flex flex-col gap-2">
               <Button
@@ -4392,21 +4596,61 @@ export default function TicketDetail() {
                 </div>
               </section>
 
-              {(ticketKind === "main" || ticketKind === "qa_fix" || editForm.qa_preview_url || editForm.qa_review_notes || editForm.qa_test_instructions) && (
+              {(ticketKind === "main" || ticketKind === "qa_fix" || normalizeQaPreviewEntries(editForm.qa_preview_links).length > 0 || editForm.qa_review_notes || editForm.qa_test_instructions) && (
                 <section className="space-y-4 rounded-[24px] bg-muted/20 p-4 sm:p-5">
-                  <div className="space-y-1">
-                    <p className={sectionEyebrowClass}>QA / Review</p>
-                    <h4 className="text-base font-semibold text-foreground">Contesto preview</h4>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <p className={sectionEyebrowClass}>QA / Review</p>
+                      <h4 className="text-base font-semibold text-foreground">Contesto preview</h4>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-9 rounded-xl text-xs"
+                      onClick={addEditPreviewLink}
+                    >
+                      <Plus className="mr-1.5 h-3.5 w-3.5" />
+                      Aggiungi preview
+                    </Button>
                   </div>
 
                   <div className="space-y-1.5">
-                    <label className={sidebarLabelClass}>Preview URL</label>
-                    <Input
-                      value={editForm.qa_preview_url || ""}
-                      onChange={e => setEditForm({ ...editForm, qa_preview_url: e.target.value })}
-                      placeholder="https://..."
-                      className="h-11 text-sm"
-                    />
+                    <label className={sidebarLabelClass}>Link preview</label>
+                    <div className="space-y-2.5">
+                      {(editForm.qa_preview_links || [{ title: "", url: "" }]).map((previewLink, index) => (
+                        <div key={index} className="flex flex-col gap-2 sm:flex-row">
+                          <Input
+                            value={previewLink.title || ""}
+                            onChange={(event) =>
+                              updateEditPreviewLink(index, "title", event.target.value)
+                            }
+                            placeholder={`Titolo preview ${index + 1}`}
+                            className="h-11 text-sm sm:w-2/5"
+                          />
+                          <Input
+                            value={previewLink.url || ""}
+                            onChange={(event) =>
+                              updateEditPreviewLink(index, "url", event.target.value)
+                            }
+                            placeholder="https://..."
+                            className="h-11 min-w-0 flex-1 text-sm"
+                          />
+                          {(editForm.qa_preview_links || []).length > 1 && (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="icon"
+                              className="h-11 w-11 shrink-0 rounded-xl"
+                              onClick={() => removeEditPreviewLink(index)}
+                              aria-label={`Rimuovi preview ${index + 1}`}
+                            >
+                              <X className="h-4 w-4" />
+                            </Button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
                   </div>
 
                   <div className="space-y-1.5">
@@ -4467,15 +4711,53 @@ export default function TicketDetail() {
           <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4 sm:px-7 sm:py-5">
             <div className="space-y-4 rounded-[24px] bg-muted/20 p-4 sm:p-5">
               <div className="space-y-1.5">
-                <label className={sidebarLabelClass}>Preview URL *</label>
-                <Input
-                  value={qaRequestForm.preview_url}
-                  onChange={(event) =>
-                    setQaRequestForm((prev) => ({ ...prev, preview_url: event.target.value }))
-                  }
-                  placeholder="https://..."
-                  className="h-11 text-sm"
-                />
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <label className={sidebarLabelClass}>Link preview *</label>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-9 rounded-xl text-xs"
+                    onClick={addQaRequestPreviewLink}
+                  >
+                    <Plus className="mr-1.5 h-3.5 w-3.5" />
+                    Aggiungi preview
+                  </Button>
+                </div>
+                <div className="space-y-2.5">
+                  {(qaRequestForm.preview_links || [{ title: "", url: "" }]).map((previewLink, index) => (
+                    <div key={index} className="flex flex-col gap-2 sm:flex-row">
+                      <Input
+                        value={previewLink.title || ""}
+                        onChange={(event) =>
+                          updateQaRequestPreviewLink(index, "title", event.target.value)
+                        }
+                        placeholder={`Titolo preview ${index + 1}`}
+                        className="h-11 text-sm sm:w-2/5"
+                      />
+                      <Input
+                        value={previewLink.url || ""}
+                        onChange={(event) =>
+                          updateQaRequestPreviewLink(index, "url", event.target.value)
+                        }
+                        placeholder="https://..."
+                        className="h-11 min-w-0 flex-1 text-sm"
+                      />
+                      {(qaRequestForm.preview_links || []).length > 1 && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="icon"
+                          className="h-11 w-11 shrink-0 rounded-xl"
+                          onClick={() => removeQaRequestPreviewLink(index)}
+                          aria-label={`Rimuovi preview ${index + 1}`}
+                        >
+                          <X className="h-4 w-4" />
+                        </Button>
+                      )}
+                    </div>
+                  ))}
+                </div>
               </div>
 
               <div className="space-y-1.5">
@@ -4517,7 +4799,10 @@ export default function TicketDetail() {
               <Button
                 className="h-10 rounded-xl bg-violet-600 text-sm text-white hover:bg-violet-700 sm:min-w-[180px]"
                 onClick={handleQaRequestSubmit}
-                disabled={submittingQaRequest || !String(qaRequestForm.preview_url || "").trim()}
+                disabled={
+                  submittingQaRequest ||
+                  normalizeQaPreviewEntries(qaRequestForm.preview_links).length === 0
+                }
               >
                 {submittingQaRequest ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
                 Invia in review
@@ -4943,27 +5228,39 @@ export default function TicketDetail() {
                       </div>
                     </div>
                   )}
-                  {(reviewPreviewSource?.qa_preview_url || reviewPreviewSource?.qa_review_notes || reviewPreviewSource?.qa_test_instructions || isQaReviewTicket) && (
+                  {(reviewPreviewLinks.length > 0 || reviewPreviewSource?.qa_review_notes || reviewPreviewSource?.qa_test_instructions || isQaReviewTicket) && (
                     <div className="space-y-2">
                       <p className={sectionEyebrowClass}>QA / Review</p>
                       <div className="overflow-hidden rounded-2xl border border-cyan-200/70 bg-cyan-50/70 p-5 dark:border-cyan-500/25 dark:bg-cyan-500/10">
                         <div className={`grid gap-4 ${hasQaSidebarMeta ? "2xl:grid-cols-[minmax(0,1fr)_220px]" : ""}`}>
                           <div className="min-w-0 space-y-4">
-                            {reviewPreviewSource?.qa_preview_url && (
+                            {reviewPreviewLinks.length > 0 && (
                               <div className="min-w-0 space-y-1.5">
-                                <p className={sidebarLabelClass}>Preview</p>
-                                <a
-                                  href={reviewPreviewSource.qa_preview_url}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  title={reviewPreviewSource.qa_preview_url}
-                                  className="flex w-full max-w-full min-w-0 overflow-hidden items-center gap-2 rounded-2xl border border-cyan-200/70 bg-background/90 px-3.5 py-3 text-sm transition-colors hover:border-primary/25 hover:bg-primary/5 dark:border-cyan-500/25"
-                                >
-                                  <ExternalLink className="h-3.5 w-3.5 shrink-0 text-primary" />
-                                  <span className="block min-w-0 flex-1 truncate font-medium text-foreground">
-                                    {reviewPreviewSource.qa_preview_url}
-                                  </span>
-                                </a>
+                                <p className={sidebarLabelClass}>
+                                  {reviewPreviewLinks.length === 1 ? "Preview" : "Preview disponibili"}
+                                </p>
+                                <div className="space-y-2">
+                                  {reviewPreviewLinks.map((previewLink) => (
+                                    <a
+                                      key={previewLink.url}
+                                      href={previewLink.url}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      title={previewLink.url}
+                                      className="flex w-full max-w-full min-w-0 overflow-hidden items-center gap-2 rounded-2xl border border-cyan-200/70 bg-background/90 px-3.5 py-3 text-sm transition-colors hover:border-primary/25 hover:bg-primary/5 dark:border-cyan-500/25"
+                                    >
+                                      <ExternalLink className="h-3.5 w-3.5 shrink-0 text-primary" />
+                                      <div className="min-w-0 flex-1">
+                                        <p className="truncate font-medium text-foreground">
+                                          {previewLink.title}
+                                        </p>
+                                        <p className="truncate text-xs text-muted-foreground">
+                                          {previewLink.url}
+                                        </p>
+                                      </div>
+                                    </a>
+                                  ))}
+                                </div>
                               </div>
                             )}
 

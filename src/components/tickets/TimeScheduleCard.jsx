@@ -305,21 +305,6 @@ export default function TimeScheduleCard({ ticket, canEdit, onUpdate }) {
      return;
    }
 
-   // Check for scheduling conflicts
-   const conflict = checkScheduleConflict(
-     allTickets,
-     ticket.assignee_id,
-     getEffectivePriorityScore(ticket),
-     editDate,
-     editStart,
-     editEnd,
-     ticket.id,
-     assignedDeveloper
-   );
-   if (conflict.status !== "ok") {
-     setConflictInfo(conflict);
-   }
-
    const normalizedContinuation = (editContinuation || [])
      .map((cont) => ({
        date: String(cont?.date || "").trim(),
@@ -383,6 +368,31 @@ export default function TimeScheduleCard({ ticket, canEdit, onUpdate }) {
      });
      setSaving(false);
      return;
+   }
+
+   const plannedSlots = [
+     { date: editDate, start_time: editStart, end_time: firstDayEnd },
+     ...continuationSchedule,
+   ];
+   for (const slot of plannedSlots) {
+     const conflict = checkScheduleConflict(
+       allTickets,
+       ticket.assignee_id,
+       getEffectivePriorityScore(ticket),
+       slot.date,
+       slot.start_time,
+       slot.end_time,
+       ticket.id,
+       assignedDeveloper
+     );
+     if (conflict.status !== "ok") {
+       setConflictInfo({
+         ...conflict,
+         message: `${slot.date} ${slot.start_time}-${slot.end_time}: ${conflict.message}`,
+       });
+       setSaving(false);
+       return;
+     }
    }
 
     const updates = {

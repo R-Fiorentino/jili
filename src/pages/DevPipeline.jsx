@@ -584,6 +584,12 @@ function getAllTicketSegments(ticket) {
   return normalizeTicketSegments(segments);
 }
 
+function getTicketSegmentsOnDate(ticket, dateStr) {
+  return getAllTicketSegments(ticket).filter(
+    (segment) => String(segment.date || "") === String(dateStr || "")
+  );
+}
+
 function getRomeDateFromTimestamp(value) {
   if (!value) return null;
   const parsed = new Date(value);
@@ -1207,13 +1213,13 @@ function buildTimeSchedule(devTickets, days, dev) {
  * Find first available date for a dev (exported for TicketDetail)
  */
 /**
- * Check for scheduling conflicts and suggest alternatives based on ticket priorities.
- * Returns { status: 'ok'|'warning'|'error', message, suggestedSchedule }
+ * Check for scheduling conflicts and suggest alternatives.
+ * Returns { status: 'ok'|'error', message, suggestedSchedule }
  */
 export function checkScheduleConflict(
   allTickets,
   devId,
-  ticketPriority,
+  _ticketPriority,
   scheduledDate,
   startTime,
   endTime,
@@ -1223,7 +1229,7 @@ export function checkScheduleConflict(
   const newStart = timeToDecimal(startTime);
   const newEnd = timeToDecimal(endTime);
   
-  if (!newStart || !newEnd || newEnd <= newStart) {
+  if (!Number.isFinite(newStart) || !Number.isFinite(newEnd) || newEnd <= newStart) {
     return { status: 'error', message: 'Invalid time range', suggestedSchedule: null };
   }
 
@@ -1236,7 +1242,9 @@ export function checkScheduleConflict(
 
   if (hasUnavailableOverlap) {
     const effortHours = roundHalf(newEnd - newStart);
-    const schedule = findOptimalSchedule(allTickets, devId, effortHours, 8, dev);
+    const schedule = findOptimalSchedule(allTickets, devId, effortHours, 8, dev, {
+      excludeTicketIds: [ticketId].filter(Boolean),
+    });
     const suggestion = schedule.length > 0
       ? { date: schedule[0].date, start_time: schedule[0].start_time, end_time: schedule[0].end_time }
       : null;
@@ -1248,51 +1256,39 @@ export function checkScheduleConflict(
     };
   }
 
-  // Get all other tickets for this dev on the target date (excluding the current ticket if updating)
-  const conflictingTickets = allTickets.filter(t => 
-    t.assignee_id === devId && 
-    t.scheduled_date === scheduledDate && 
-    t.id !== ticketId &&
-    isSchedulableTicket(t) &&
-    t.start_time && t.end_time
-  );
-
-  // Check for time overlaps
-  const conflicts = conflictingTickets.filter(t => {
-    const tStart = timeToDecimal(t.start_time);
-    const tEnd = timeToDecimal(t.end_time);
-    return !(newEnd <= tStart || newStart >= tEnd); // Overlap exists
-  });
+  const conflicts = (allTickets || [])
+    .filter((t) =>
+      t.assignee_id === devId &&
+      t.id !== ticketId &&
+      isSchedulableTicket(t)
+    )
+    .flatMap((t) =>
+      getTicketSegmentsOnDate(t, scheduledDate)
+        .filter((segment) => getSlotOverlap(newStart, newEnd, segment.start, segment.end) > 0)
+        .map((segment) => ({ ticket: t, segment }))
+    );
 
   if (conflicts.length === 0) {
     return { status: 'ok', message: 'No conflicts', suggestedSchedule: null };
   }
 
-  // If there are conflicts, check priorities
-  const ticketPrio = ticketPriority ?? 0;
-  const hasHigherPriorityConflict = conflicts.some(c => 
-    getEffectivePriorityScore(c) > ticketPrio
-  );
-
-  if (hasHigherPriorityConflict) {
-    return {
-      status: 'error',
-      message: 'Conflitto con ticket a priorità più alta. Impossibile pianificare a questo orario.',
-      suggestedSchedule: null
-    };
-  }
-
-  // All conflicting tickets have lower or equal priority, suggest best alternative slot
   const effortHours = roundHalf(newEnd - newStart);
-  const schedule = findOptimalSchedule(allTickets, devId, effortHours, 8, dev);
+  const schedule = findOptimalSchedule(allTickets, devId, effortHours, 8, dev, {
+    excludeTicketIds: [ticketId].filter(Boolean),
+  });
   
   const suggestion = schedule.length > 0 
     ? { date: schedule[0].date, start_time: schedule[0].start_time, end_time: schedule[0].end_time }
     : null;
+  const firstConflict = conflicts[0];
+  const conflictTitle = firstConflict?.ticket?.title || "un'altra task";
+  const conflictTime = firstConflict?.segment
+    ? `${decimalToTime(firstConflict.segment.start)}-${decimalToTime(firstConflict.segment.end)}`
+    : "";
 
   return {
-    status: 'warning',
-    message: `Conflitto con ${conflicts.length} ticket a priorità inferiore. Suggerito: ${suggestion ? `${suggestion.date} ${suggestion.start_time}-${suggestion.end_time}` : 'nessuno'}`,
+    status: "error",
+    message: `Slot occupato da ${conflictTitle}${conflictTime ? ` (${conflictTime})` : ""}. Non possono esserci due task nello stesso slot.`,
     suggestedSchedule: suggestion
   };
 }
@@ -1306,9 +1302,17 @@ export function findFirstAvailableDate(allTickets, devId, effortHours, dailyCapa
  * Find optimal schedule slots for a task, considering current time and existing tickets.
  * Returns array of { date, start_time, end_time, hours }
  */
-export function findOptimalSchedule(allTickets, devId, effortHours, dailyCapacity = 8, dev = null) {
+export function findOptimalSchedule(
+  allTickets,
+  devId,
+  effortHours,
+  dailyCapacity = 8,
+  dev = null,
+  { excludeTicketIds = [] } = {}
+) {
   const result = [];
   let remaining = roundHalf(effortHours);
+  const excludedIds = new Set((excludeTicketIds || []).filter(Boolean));
   const scheduleFrom = moment().startOf("day").format("YYYY-MM-DD");
   const scheduleTo = moment().startOf("day").add(90, "days").format("YYYY-MM-DD");
   const unavailableIntervalsByDate = getDeveloperUnavailableIntervalsByDate(dev, {
@@ -1319,15 +1323,15 @@ export function findOptimalSchedule(allTickets, devId, effortHours, dailyCapacit
   // Build existing schedule by date
   const dateSchedule = {}; // date -> [{ start, end }]
   allTickets
-    .filter((t) => t.assignee_id === devId && isSchedulableTicket(t))
+    .filter((t) => t.assignee_id === devId && isSchedulableTicket(t) && !excludedIds.has(t.id))
     .forEach(t => {
-      if (t.scheduled_date && t.start_time && t.end_time) {
-        if (!dateSchedule[t.scheduled_date]) dateSchedule[t.scheduled_date] = [];
-        dateSchedule[t.scheduled_date].push({
-          start: timeToDecimal(t.start_time),
-          end: timeToDecimal(t.end_time),
+      getAllTicketSegments(t).forEach((segment) => {
+        if (!dateSchedule[segment.date]) dateSchedule[segment.date] = [];
+        dateSchedule[segment.date].push({
+          start: segment.start,
+          end: segment.end,
         });
-      }
+      });
     });
 
   // Sort existing slots by start time
