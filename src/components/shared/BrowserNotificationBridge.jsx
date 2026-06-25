@@ -6,7 +6,6 @@ import { useAuth } from "@/lib/AuthContext";
 import {
   areBrowserNotificationsEnabled,
   getBrowserNotificationPermission,
-  isBrowserNotificationSupported,
   showBrowserNotification,
 } from "@/lib/browserNotifications";
 
@@ -60,7 +59,6 @@ export default function BrowserNotificationBridge() {
 
   useEffect(() => {
     if (!user?.id || !isAuthenticated) return undefined;
-    if (!isBrowserNotificationSupported()) return undefined;
 
     const notificationsQuery = query(
       collection(db, "notifications"),

@@ -38,7 +38,7 @@ export default function TicketReport() {
 
   const { data: ticket, isLoading } = useQuery({
     queryKey: ["ticket", ticketId],
-    queryFn: () => appClient.entities.Ticket.list().then((all) => all.find((row) => row.id === ticketId)),
+    queryFn: () => appClient.entities.Ticket.get(ticketId),
     enabled: !!ticketId,
   });
 

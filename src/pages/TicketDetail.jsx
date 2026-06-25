@@ -921,20 +921,18 @@ export default function TicketDetail() {
     pipelineDeveloperId,
   });
 
-  const { data: ticket, isLoading } = useQuery({
-    queryKey: ["ticket", ticketId],
-    queryFn: () => appClient.entities.Ticket.list().then(all => all.find(t => t.id === ticketId)),
-    enabled: !!ticketId,
+  const { data: tickets = [], isLoading } = useQuery({
+    queryKey: ["tickets"],
+    queryFn: () => appClient.entities.Ticket.list(),
   });
+  const ticket = useMemo(
+    () => tickets.find((entry) => entry.id === ticketId),
+    [ticketId, tickets]
+  );
 
   const { data: developers = [] } = useQuery({
     queryKey: ["developers"],
     queryFn: () => appClient.entities.Developer.list(),
-  });
-
-  const { data: tickets = [] } = useQuery({
-    queryKey: ["tickets"],
-    queryFn: () => appClient.entities.Ticket.list(),
   });
 
   const { data: clients = [] } = useQuery({
@@ -5731,6 +5729,7 @@ export default function TicketDetail() {
             onUpdate={async (options = {}) => {
               await applyRebalanceForDevelopers([ticket.assignee_id], options);
               await queryClient.invalidateQueries({ queryKey: ["ticket", ticketId] });
+              await queryClient.invalidateQueries({ queryKey: ["tickets"] });
               await notifyClientSupervisor({
                 title: "Pianificazione ticket aggiornata",
                 body: ticket.title,

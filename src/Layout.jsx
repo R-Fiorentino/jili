@@ -106,7 +106,7 @@ export default function Layout({ children, currentPageName }) {
     queryKey: ["notifications", user?.id],
     queryFn: () => appClient.entities.Notification.filter({ recipient_id: user.id }),
     enabled: !!user?.id,
-    refetchInterval: 30000,
+    staleTime: Infinity,
   });
   const unreadNotifications = myNotifications.filter((item) => !item.read).length;
 

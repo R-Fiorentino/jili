@@ -31,6 +31,96 @@ const COLLECTIONS = {
   User: "users",
 };
 const SIGNUP_PASSPHRASE = (import.meta.env.VITE_SIGNUP_PASSPHRASE || "").trim();
+const ENTITY_CACHE_TTL_MS = {
+  Client: 5 * 60 * 1000,
+  Developer: 2 * 60 * 1000,
+  Notification: 15 * 1000,
+  PriorityConfig: 5 * 60 * 1000,
+  Ticket: 30 * 1000,
+  User: 2 * 60 * 1000,
+};
+const entityRequestCache = new Map();
+const entityRequestsInFlight = new Map();
+const entityCacheVersions = new Map();
+let cachedUserProfile = null;
+let userProfileRequestInFlight = null;
+
+function getEntityCacheKey(entityName, operation, params = "") {
+  return `${entityName}:${operation}:${params}`;
+}
+
+function getFullListCacheKey(entityName) {
+  return getEntityCacheKey(entityName, "list", "all");
+}
+
+function readEntityCache(cacheKey) {
+  const cached = entityRequestCache.get(cacheKey);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    entityRequestCache.delete(cacheKey);
+    return null;
+  }
+  return cached.data;
+}
+
+function writeEntityCache(entityName, cacheKey, data) {
+  entityRequestCache.set(cacheKey, {
+    data,
+    expiresAt: Date.now() + (ENTITY_CACHE_TTL_MS[entityName] || 30 * 1000),
+  });
+  return data;
+}
+
+function clearEntityRequestCache(entityName, { preserveFullList = false } = {}) {
+  entityCacheVersions.set(
+    entityName,
+    (entityCacheVersions.get(entityName) || 0) + 1
+  );
+  const fullListKey = getFullListCacheKey(entityName);
+  for (const key of entityRequestCache.keys()) {
+    if (!key.startsWith(`${entityName}:`)) continue;
+    if (preserveFullList && key === fullListKey) continue;
+    entityRequestCache.delete(key);
+  }
+  for (const key of entityRequestsInFlight.keys()) {
+    if (key.startsWith(`${entityName}:`)) entityRequestsInFlight.delete(key);
+  }
+}
+
+function updateCachedFullList(entityName, updater) {
+  const fullListKey = getFullListCacheKey(entityName);
+  const cachedItems = readEntityCache(fullListKey);
+  clearEntityRequestCache(entityName);
+  if (!Array.isArray(cachedItems)) return;
+  writeEntityCache(entityName, fullListKey, updater(cachedItems));
+}
+
+async function runCachedEntityRequest(entityName, cacheKey, request) {
+  const cached = readEntityCache(cacheKey);
+  if (cached) return cached;
+
+  const inFlight = entityRequestsInFlight.get(cacheKey);
+  if (inFlight) return inFlight;
+
+  const requestVersion = entityCacheVersions.get(entityName) || 0;
+  let pending;
+  pending = Promise.resolve()
+    .then(request)
+    .then((data) => {
+      if ((entityCacheVersions.get(entityName) || 0) !== requestVersion) {
+        return data;
+      }
+      return writeEntityCache(entityName, cacheKey, data);
+    })
+    .finally(() => {
+      if (entityRequestsInFlight.get(cacheKey) === pending) {
+        entityRequestsInFlight.delete(cacheKey);
+      }
+    });
+
+  entityRequestsInFlight.set(cacheKey, pending);
+  return pending;
+}
 
 function toIsoString(value) {
   if (!value) return null;
@@ -175,6 +265,29 @@ function collectionRef(entityName) {
 }
 
 async function ensureUserProfile(firebaseUser) {
+  if (
+    cachedUserProfile?.uid === firebaseUser.uid &&
+    cachedUserProfile.expiresAt > Date.now()
+  ) {
+    return cachedUserProfile.data;
+  }
+  if (userProfileRequestInFlight?.uid === firebaseUser.uid) {
+    return userProfileRequestInFlight.promise;
+  }
+
+  const profilePromise = loadAndEnsureUserProfile(firebaseUser).finally(() => {
+    if (userProfileRequestInFlight?.uid === firebaseUser.uid) {
+      userProfileRequestInFlight = null;
+    }
+  });
+  userProfileRequestInFlight = {
+    uid: firebaseUser.uid,
+    promise: profilePromise,
+  };
+  return profilePromise;
+}
+
+async function loadAndEnsureUserProfile(firebaseUser) {
   const userRef = doc(db, "users", firebaseUser.uid);
   const snapshot = await getDoc(userRef);
   const now = new Date().toISOString();
@@ -192,7 +305,13 @@ async function ensureUserProfile(firebaseUser) {
     };
 
     await setDoc(userRef, initialUser);
-    return normalizeDoc(firebaseUser.uid, initialUser);
+    const normalizedInitialUser = normalizeDoc(firebaseUser.uid, initialUser);
+    cachedUserProfile = {
+      uid: firebaseUser.uid,
+      data: normalizedInitialUser,
+      expiresAt: Date.now() + ENTITY_CACHE_TTL_MS.User,
+    };
+    return normalizedInitialUser;
   }
 
   const current = snapshot.data() || {};
@@ -235,13 +354,19 @@ async function ensureUserProfile(firebaseUser) {
     }
   }
 
-  return {
+  const normalizedUser = {
     ...normalizeDoc(firebaseUser.uid, merged),
     raw_role: merged.role || role,
     secondary_role: merged.role || role,
     role,
     app_role: merged.app_role || role,
   };
+  cachedUserProfile = {
+    uid: firebaseUser.uid,
+    data: normalizedUser,
+    expiresAt: Date.now() + ENTITY_CACHE_TTL_MS.User,
+  };
+  return normalizedUser;
 }
 
 async function getCurrentUserOrThrow() {
@@ -259,44 +384,72 @@ function createEntityApi(entityName) {
   const ref = collectionRef(entityName);
   const api = {
     async list(sort, maxItems) {
-      const { field, direction } = parseSort(sort);
+      const fullListKey = getFullListCacheKey(entityName);
+      const cachedFullList = readEntityCache(fullListKey);
+      if (cachedFullList) {
+        return limitInMemory(sortInMemory(cachedFullList, sort), maxItems);
+      }
 
-      try {
+      const { field, direction } = parseSort(sort);
+      const cacheKey =
+        !field && !Number.isFinite(maxItems)
+          ? fullListKey
+          : getEntityCacheKey(
+              entityName,
+              "list",
+              JSON.stringify({ sort: sort || "", maxItems: maxItems || null })
+            );
+
+      return runCachedEntityRequest(entityName, cacheKey, async () => {
         const constraints = [];
-        if (field) {
-          constraints.push(orderBy(field, direction));
-        }
+        if (field) constraints.push(orderBy(field, direction));
         if (Number.isFinite(maxItems) && maxItems > 0) {
           constraints.push(limitDocs(maxItems));
         }
 
-        const snapshot =
-          constraints.length > 0
-            ? await getDocs(query(ref, ...constraints))
-            : await getDocs(ref);
+        try {
+          const snapshot =
+            constraints.length > 0
+              ? await getDocs(query(ref, ...constraints))
+              : await getDocs(ref);
+          let items = snapshot.docs.map((document) =>
+            normalizeDoc(document.id, document.data())
+          );
 
-        let items = snapshot.docs.map((document) =>
-          normalizeDoc(document.id, document.data())
-        );
-
-        if (!field && sort) {
+          if (!field && sort) {
+            items = sortInMemory(items, sort);
+          }
+          if (!(Number.isFinite(maxItems) && maxItems > 0 && constraints.length > 0)) {
+            items = limitInMemory(items, maxItems);
+          }
+          return items;
+        } catch (error) {
+          if (constraints.length === 0) throw error;
+          const snapshot = await getDocs(ref);
+          let items = snapshot.docs.map((document) =>
+            normalizeDoc(document.id, document.data())
+          );
           items = sortInMemory(items, sort);
+          return limitInMemory(items, maxItems);
         }
+      });
+    },
 
-        if (!(Number.isFinite(maxItems) && maxItems > 0 && constraints.length > 0)) {
-          items = limitInMemory(items, maxItems);
-        }
+    async get(id) {
+      if (!id) return null;
 
-        return items;
-      } catch (error) {
-        const snapshot = await getDocs(ref);
-        let items = snapshot.docs.map((document) =>
-          normalizeDoc(document.id, document.data())
-        );
-        items = sortInMemory(items, sort);
-        items = limitInMemory(items, maxItems);
-        return items;
+      const cachedFullList = readEntityCache(getFullListCacheKey(entityName));
+      if (cachedFullList) {
+        return cachedFullList.find((item) => item.id === id) || null;
       }
+
+      const cacheKey = getEntityCacheKey(entityName, "get", id);
+      return runCachedEntityRequest(entityName, cacheKey, async () => {
+        const snapshot = await getDoc(doc(db, COLLECTIONS[entityName], id));
+        return snapshot.exists()
+          ? normalizeDoc(snapshot.id, snapshot.data())
+          : null;
+      });
     },
 
     async filter(filters = {}) {
@@ -308,25 +461,48 @@ function createEntityApi(entityName) {
         return api.list();
       }
 
-      try {
-        const constraints = filterEntries.map(([key, value]) =>
-          where(key, "==", value)
-        );
-        const snapshot = await getDocs(query(ref, ...constraints));
-        return snapshot.docs.map((document) =>
-          normalizeDoc(document.id, document.data())
-        );
-      } catch (error) {
-        const all = await api.list();
-        return all.filter((item) =>
+      const cachedFullList = readEntityCache(getFullListCacheKey(entityName));
+      if (cachedFullList) {
+        return cachedFullList.filter((item) =>
           filterEntries.every(([key, value]) => item?.[key] === value)
         );
       }
+
+      const normalizedFilters = Object.fromEntries(
+        [...filterEntries].sort(([a], [b]) => a.localeCompare(b))
+      );
+      const cacheKey = getEntityCacheKey(
+        entityName,
+        "filter",
+        JSON.stringify(normalizedFilters)
+      );
+
+      return runCachedEntityRequest(entityName, cacheKey, async () => {
+        try {
+          const constraints = filterEntries.map(([key, value]) =>
+            where(key, "==", value)
+          );
+          const snapshot = await getDocs(query(ref, ...constraints));
+          return snapshot.docs.map((document) =>
+            normalizeDoc(document.id, document.data())
+          );
+        } catch (error) {
+          const all = await api.list();
+          return all.filter((item) =>
+            filterEntries.every(([key, value]) => item?.[key] === value)
+          );
+        }
+      });
     },
 
     async create(payload) {
       const now = new Date().toISOString();
-      const currentUser = await getCurrentUserOrThrow();
+      const currentUser = auth.currentUser;
+      if (!currentUser) {
+        const error = new Error("Authentication required");
+        error.status = 401;
+        throw error;
+      }
       const sanitizedPayload = sanitizeForFirestore(payload || {});
 
       const data = {
@@ -337,12 +513,14 @@ function createEntityApi(entityName) {
         updated_at: serverTimestamp(),
       };
 
-      if (entityName === "Ticket" && !data.created_by && currentUser?.email) {
+      if (entityName === "Ticket" && !data.created_by && currentUser.email) {
         data.created_by = currentUser.email;
       }
 
       const documentRef = await addDoc(ref, data);
-      return normalizeDoc(documentRef.id, data);
+      const created = normalizeDoc(documentRef.id, data);
+      updateCachedFullList(entityName, (items) => [...items, created]);
+      return created;
     },
 
     async update(id, payload) {
@@ -359,7 +537,11 @@ function createEntityApi(entityName) {
       };
 
       await setDoc(doc(db, COLLECTIONS[entityName], id), data, { merge: true });
-      return normalizeDoc(id, data);
+      const updated = normalizeDoc(id, data);
+      updateCachedFullList(entityName, (items) =>
+        items.map((item) => (item.id === id ? { ...item, ...updated } : item))
+      );
+      return updated;
     },
 
     async delete(id) {
@@ -368,6 +550,9 @@ function createEntityApi(entityName) {
       }
 
       await deleteDoc(doc(db, COLLECTIONS[entityName], id));
+      updateCachedFullList(entityName, (items) =>
+        items.filter((item) => item.id !== id)
+      );
       return { success: true, id };
     },
   };
@@ -396,7 +581,16 @@ const authApi = {
     };
 
     await setDoc(doc(db, "users", user.id), data, { merge: true });
-    return { ...user, ...normalizeValue(data) };
+    const updatedUser = { ...user, ...normalizeValue(data) };
+    cachedUserProfile = {
+      uid: user.id,
+      data: updatedUser,
+      expiresAt: Date.now() + ENTITY_CACHE_TTL_MS.User,
+    };
+    updateCachedFullList("User", (items) =>
+      items.map((item) => (item.id === user.id ? updatedUser : item))
+    );
+    return updatedUser;
   },
 
   async signInWithEmail(email, password) {
@@ -456,6 +650,11 @@ const authApi = {
   },
 
   async logout() {
+    cachedUserProfile = null;
+    userProfileRequestInFlight = null;
+    entityRequestCache.clear();
+    entityRequestsInFlight.clear();
+    entityCacheVersions.clear();
     await signOut(auth);
     return { success: true };
   },

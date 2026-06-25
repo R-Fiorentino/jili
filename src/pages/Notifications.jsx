@@ -71,7 +71,7 @@ export default function Notifications() {
     queryKey: ["notifications", user?.id],
     queryFn: () => appClient.entities.Notification.filter({ recipient_id: user.id }),
     enabled: !!user?.id,
-    refetchInterval: 30000,
+    staleTime: Infinity,
   });
 
   const sortedNotifications = [...notifications].sort((a, b) => {
