@@ -43,6 +43,7 @@ import { useCurrentUser } from "../components/shared/useCurrentUser";
 import TimeScheduleCard from "../components/tickets/TimeScheduleCard";
 import { buildReferenceLinksPayload, getReferenceLinkLabel, normalizeReferenceLinks } from "../components/shared/ticketReferenceLinks";
 import {
+  createNotification,
   normalizeTicketWatchers,
   notifyClientTicketUpdate,
   notifyLiveOpsCompleted,
@@ -900,6 +901,7 @@ export default function TicketDetail() {
   const [postPreviewEffortInput, setPostPreviewEffortInput] = useState(String(POST_PREVIEW_CHANGE_EFFORT_HOURS));
   const [postPreviewAssigneeId, setPostPreviewAssigneeId] = useState("");
   const [submittingPostPreviewChange, setSubmittingPostPreviewChange] = useState(false);
+  const [submittingUrgency, setSubmittingUrgency] = useState(false);
   const [watcherToAddId, setWatcherToAddId] = useState("");
   const { user, isAnalyst, isDeveloper, isAdmin, isTechSupervisor } = useCurrentUser();
 
@@ -2314,6 +2316,178 @@ export default function TicketDetail() {
     setActualEffortInput("");
   };
 
+  const handleUrgencyRequest = async () => {
+    if (!ticket?.id || submittingUrgency) return;
+    if (ticket.urgent_requested_at) {
+      toast({
+        title: "Urgenza gia attiva",
+        description: "Questo ticket e gia marcato come urgente.",
+      });
+      return;
+    }
+
+    const developer = resolveTicketAssigneeDeveloper(ticket);
+    if (!developer?.id) {
+      toast({
+        variant: "destructive",
+        title: "Assignee mancante",
+        description: "Assegna il ticket a un developer prima di portarlo in urgenza.",
+      });
+      return;
+    }
+
+    const hasPlanningEffort =
+      getPlannedEffortHours(ticket) > 0 ||
+      getTicketScheduleSegments(ticket).length > 0;
+    if (!hasPlanningEffort) {
+      toast({
+        variant: "destructive",
+        title: "Effort mancante",
+        description: "Inserisci l'effort previsto prima di ripianificare il ticket in urgenza.",
+      });
+      return;
+    }
+
+    setSubmittingUrgency(true);
+    try {
+      const scheduledUpdates = await schedulePriorityInsertionBeforeNew({
+        developer,
+        ticketId: ticket.id,
+        insertBeforeNextActivity: true,
+      });
+      const nowIso = new Date().toISOString();
+      const nextTicket = { ...ticket, ...(scheduledUpdates || {}) };
+      const nextSegments = getTicketScheduleSegments(nextTicket);
+      const firstSegment = nextSegments[0] || null;
+      const firstSlotLabel = firstSegment
+        ? `${firstSegment.date} ${decimalToTime(firstSegment.start)}-${decimalToTime(firstSegment.end)}`
+        : "prima finestra utile";
+      const urgencyPayload = {
+        urgent_requested_at: nowIso,
+        urgent_requested_by: user?.email || user?.full_name || "user",
+        urgent_requested_by_id: user?.id || null,
+        audit_log: [
+          ...(ticket.audit_log || []),
+          buildAuditEntry(
+            "urgency_requested",
+            `Urgenza pipeline richiesta; inserita in ${firstSlotLabel}`
+          ),
+        ],
+      };
+
+      await appClient.entities.Ticket.update(ticket.id, urgencyPayload);
+
+      const assigneeUser = users.find(
+        (candidate) =>
+          normalizeText(candidate?.email) === normalizeText(developer.email || ticket.assignee_email)
+      );
+      if (assigneeUser?.id) {
+        await createNotification({
+          recipientId: assigneeUser.id,
+          recipientEmail: assigneeUser.email,
+          actor: user,
+          type: "ticket_urgent",
+          title: "Ticket portato in urgenza",
+          body: `${ticket.title} · ${firstSlotLabel}`,
+          ticket: { ...nextTicket, ...urgencyPayload },
+          metadata: {
+            reason: "ticket_urgent",
+            scheduled_slot: firstSlotLabel,
+          },
+        }).catch(() => {});
+      }
+
+      await notifyClientSupervisor({
+        ticketOverride: { ...nextTicket, ...urgencyPayload },
+        title: "Ticket portato in urgenza",
+        body: `${ticket.title} · ${firstSlotLabel}`,
+        metadata: {
+          reason: "ticket_urgent",
+          assignee_id: developer.id,
+          scheduled_slot: firstSlotLabel,
+        },
+      });
+
+      await queryClient.invalidateQueries({ queryKey: ["ticket", ticketId] });
+      await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+      toast({
+        title: "Urgenza pianificata",
+        description: `${ticket.title} inserito in ${firstSlotLabel}.`,
+      });
+    } finally {
+      setSubmittingUrgency(false);
+    }
+  };
+
+  const handleUrgencyClear = async () => {
+    if (!ticket?.id || submittingUrgency) return;
+
+    setSubmittingUrgency(true);
+    try {
+      const developer = resolveTicketAssigneeDeveloper(ticket);
+      const urgencyPayload = {
+        urgent_requested_at: null,
+        urgent_requested_by: null,
+        urgent_requested_by_id: null,
+        audit_log: [
+          ...(ticket.audit_log || []),
+          buildAuditEntry("urgency_removed", "Urgenza pipeline rimossa"),
+        ],
+      };
+
+      await appClient.entities.Ticket.update(ticket.id, urgencyPayload);
+
+      if (ticket.assignee_id) {
+        await applyRebalanceForDevelopers([ticket.assignee_id], {
+          includeTodayHoles: true,
+          planningStartDate: moment().format("YYYY-MM-DD"),
+          freezeCurrentWeekSegments: false,
+          preserveTodaySegments: false,
+          preserveWorkingDaysFromToday: 0,
+          preserveExistingSequence: false,
+        });
+      }
+
+      const assigneeUser = users.find(
+        (candidate) =>
+          normalizeText(candidate?.email) === normalizeText(developer?.email || ticket.assignee_email)
+      );
+      if (assigneeUser?.id) {
+        await createNotification({
+          recipientId: assigneeUser.id,
+          recipientEmail: assigneeUser.email,
+          actor: user,
+          type: "ticket_urgent",
+          title: "Urgenza rimossa",
+          body: ticket.title,
+          ticket: { ...ticket, ...urgencyPayload },
+          metadata: {
+            reason: "ticket_urgency_removed",
+          },
+        }).catch(() => {});
+      }
+
+      await notifyClientSupervisor({
+        ticketOverride: { ...ticket, ...urgencyPayload },
+        title: "Urgenza ticket rimossa",
+        body: ticket.title,
+        metadata: {
+          reason: "ticket_urgency_removed",
+          assignee_id: ticket.assignee_id || null,
+        },
+      });
+
+      await queryClient.invalidateQueries({ queryKey: ["ticket", ticketId] });
+      await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+      toast({
+        title: "Urgenza rimossa",
+        description: `${ticket.title} torna alla pianificazione standard.`,
+      });
+    } finally {
+      setSubmittingUrgency(false);
+    }
+  };
+
   const handleDeadlineSave = async () => {
     const normalizedDeadline = deadlineInput || null;
     const currentDeadline = ticket?.deadline || null;
@@ -2479,7 +2653,8 @@ export default function TicketDetail() {
             decimalToTime(segment.start),
             decimalToTime(segment.end),
             ticket.id,
-            dev
+            dev,
+            { allowTicketReflow: true }
           );
 
           if (conflict.status !== "ok") {
@@ -2573,6 +2748,7 @@ export default function TicketDetail() {
           includeTodayHoles: true,
           freezeCurrentWeekSegments: false,
           preserveTodaySegments: false,
+          allowInProgressReplan: true,
           planningStartDate: timeData.scheduled_date || nowInfo.date,
           ...(Number.isFinite(anchorStart) && timeData.scheduled_date
             ? {
@@ -2625,6 +2801,7 @@ export default function TicketDetail() {
         includeTodayHoles: true,
         freezeCurrentWeekSegments: false,
         preserveTodaySegments: false,
+        allowInProgressReplan: true,
         planningStartDate: timeData.scheduled_date || nowInfo.date,
         ...(Number.isFinite(anchorStart) && timeData.scheduled_date
           ? {
@@ -3417,6 +3594,23 @@ export default function TicketDetail() {
         ? canManageLiveOps
         : (isAnalyst || canManageAsTechSupervisor || isAssignedDeveloper))
     );
+  const hasUrgencyPlanningEffort =
+    plannedEffort > 0 || getTicketScheduleSegments(ticket).length > 0;
+  const isUrgent = Boolean(ticket?.urgent_requested_at);
+  const canManageUrgency =
+    !isQaReviewTicket &&
+    !isTicketClosed(ticket) &&
+    (isUrgent || !ticketBlocked) &&
+    (isAdmin || isAnalyst || canManageAsTechSupervisor || isAssignedDeveloper || canManageLiveOps);
+  const urgencyDisabledReason = isUrgent
+    ? ""
+    : normalizeTicketStatus(ticket.status) === "in_progress"
+      ? "Un ticket gia in corso non va portato in urgenza: e gia la task corrente."
+      : !ticket.assignee_id
+        ? "Assegna un developer prima di portarlo in urgenza."
+        : !hasUrgencyPlanningEffort
+          ? "Inserisci l'effort previsto prima di portarlo in urgenza."
+          : "";
   const clientTeamCommentTargets = (() => {
     if (!client) return [];
 
@@ -5838,7 +6032,20 @@ export default function TicketDetail() {
           )}
           
           <Card className={surfaceCardClass}>
-            <CardContent className="p-5 space-y-4">
+            <CardHeader className="pb-0">
+              <div className="space-y-1">
+                <p className={sectionEyebrowClass}>Gestione</p>
+                <CardTitle className="text-lg font-semibold">Azioni e planning</CardTitle>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              {(canResolveQaReview ||
+                canRequestPostPreviewChange ||
+                canRequestLiveOps ||
+                (isLiveOpsTicket && canManageLiveOps && !isTicketClosed(ticket)) ||
+                canManageUrgency) && (
+                <div className="space-y-3 rounded-2xl border border-border/60 bg-muted/10 p-3">
+                  <p className={sectionEyebrowClass}>Azioni operative</p>
               {canResolveQaReview && (
                 <div className="rounded-2xl border border-cyan-200 bg-cyan-50/90 p-4 dark:border-cyan-500/30 dark:bg-cyan-500/10">
                   <p className="text-xs font-semibold uppercase tracking-[0.24em] text-cyan-700 dark:text-cyan-300">
@@ -5993,7 +6200,68 @@ export default function TicketDetail() {
                 </div>
               )}
 
+              {canManageUrgency && (
+                <div className={`rounded-2xl border p-4 ${
+                  isUrgent
+                    ? "border-amber-300 bg-amber-50/95 dark:border-amber-400/40 dark:bg-amber-500/15"
+                    : "border-amber-200 bg-amber-50/90 dark:border-amber-500/30 dark:bg-amber-500/10"
+                }`}>
+                  <div className="flex items-start gap-2.5">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-300" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-amber-800 dark:text-amber-300">
+                          Urgenza pipeline
+                        </p>
+                        {isUrgent && (
+                          <Badge className="rounded-full bg-amber-600 px-2 py-0.5 text-[10px] text-white hover:bg-amber-600">
+                            Attiva
+                          </Badge>
+                        )}
+                      </div>
+                      <p className="mt-1 text-[11px] text-amber-800/85 dark:text-amber-100/85">
+                        {isUrgent
+                          ? "Questo ticket resta sopra le priorita normali finche non togli l'urgenza."
+                          : "Inserisce questo ticket subito dopo l'attivita in corso del developer e fa slittare il resto."}
+                      </p>
+                      {isUrgent && ticket.urgent_requested_by && (
+                        <p className="mt-1 text-[11px] text-amber-800/75 dark:text-amber-100/75">
+                          Attivata da {ticket.urgent_requested_by}
+                          {ticket.urgent_requested_at
+                            ? ` · ${moment(ticket.urgent_requested_at).format("DD/MM HH:mm")}`
+                            : ""}
+                        </p>
+                      )}
+                      {urgencyDisabledReason && (
+                        <p className="mt-2 text-[11px] font-medium text-amber-900 dark:text-amber-100">
+                          {urgencyDisabledReason}
+                        </p>
+                      )}
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={isUrgent ? "outline" : "default"}
+                        className={
+                          isUrgent
+                            ? "mt-3 h-8 rounded-xl border-amber-300 px-3 text-xs text-amber-800 hover:bg-amber-100 dark:border-amber-400/40 dark:text-amber-100 dark:hover:bg-amber-500/20"
+                            : "mt-3 h-8 rounded-xl bg-amber-600 px-3 text-xs text-white hover:bg-amber-700"
+                        }
+                        onClick={isUrgent ? handleUrgencyClear : handleUrgencyRequest}
+                        disabled={submittingUrgency || (!isUrgent && Boolean(urgencyDisabledReason))}
+                      >
+                        {submittingUrgency ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : null}
+                        {isUrgent ? "Togli urgenza" : "Porta in urgenza"}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              )}
+                </div>
+              )}
+
               {/* Status - analysts & admins can change freely; devs can change their assigned tickets */}
+              <div className="space-y-4 rounded-2xl border border-border/60 bg-background/40 p-3">
+                <p className={sectionEyebrowClass}>Stato e ownership</p>
               {canChangeStatus && (
                 <div>
                   <label className={`${sidebarLabelClass} mb-1.5 block`}>Status</label>
@@ -6101,6 +6369,11 @@ export default function TicketDetail() {
               </div>
 
               {/* Effort previsto (planning) */}
+              </div>
+
+              <div className="space-y-4 rounded-2xl border border-border/60 bg-background/40 p-3">
+                <p className={sectionEyebrowClass}>Effort</p>
+              {/* Effort previsto (planning) */}
               <div>
                 <label className={`${sidebarLabelClass} mb-1.5 block`}>Effort previsto (h)</label>
                 {canEditPlannedEffort ? (
@@ -6171,6 +6444,10 @@ export default function TicketDetail() {
                   <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-200/85">La pianificazione usa l’effort previsto; quello reale si consuntiva a fine attività.</p>
                 </div>
               )}
+              </div>
+
+              <div className="space-y-4 rounded-2xl border border-border/60 bg-background/40 p-3">
+                <p className={sectionEyebrowClass}>Blocchi e dati tecnici</p>
 
               {canManageMissingData && (
                 <div className={`rounded-2xl border p-3 ${priorityPaused ? "border-emerald-200 bg-emerald-50 dark:border-emerald-500/30 dark:bg-emerald-500/10" : "border-amber-200 bg-amber-50 dark:border-amber-500/30 dark:bg-amber-500/10"}`}>
@@ -6275,6 +6552,7 @@ export default function TicketDetail() {
                   <span className="text-muted-foreground">Created by</span>
                   <span className="text-right text-foreground">{ticket.created_by || "—"}</span>
                 </div>
+              </div>
               </div>
             </CardContent>
           </Card>

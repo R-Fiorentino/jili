@@ -383,7 +383,8 @@ export default function TimeScheduleCard({ ticket, canEdit, onUpdate }) {
        slot.start_time,
        slot.end_time,
        ticket.id,
-       assignedDeveloper
+       assignedDeveloper,
+       { allowTicketReflow: true }
      );
      if (conflict.status !== "ok") {
        setConflictInfo({
@@ -410,6 +411,7 @@ export default function TimeScheduleCard({ ticket, canEdit, onUpdate }) {
        planningStartDate: editDate,
        preserveWorkingDaysFromToday: 0,
        preserveExistingSequence: true,
+       allowInProgressReplan: true,
        manualInsertionAnchor: {
          date: editDate,
          start: startDec,

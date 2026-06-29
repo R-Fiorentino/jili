@@ -246,6 +246,7 @@ export default function MyTickets() {
       const diff = DIFFICULTY_CONFIG[ticket.difficulty] || DIFFICULTY_CONFIG.medium;
       const plannedEffort = getPlannedEffortHours(ticket);
       const actualEffort = getActualEffortHours(ticket);
+      const isUrgent = Boolean(ticket.urgent_requested_at);
       return (
         <Link to={createTicketDetailUrl(ticket.id, "my_tickets")}>
           <Card className="cursor-pointer border border-border bg-card shadow-sm transition-shadow hover:shadow-md">
@@ -253,6 +254,11 @@ export default function MyTickets() {
               <div className="min-w-0 flex-1">
                 <div className="mb-1 flex flex-wrap items-center gap-2">
                   <Badge className={`${status.color} text-xs`}>{status.label}</Badge>
+                  {isUrgent && (
+                    <Badge variant="outline" className="border-amber-200 bg-amber-50 text-xs font-semibold text-amber-700 dark:border-amber-500/35 dark:bg-amber-500/15 dark:text-amber-300">
+                      Urgente
+                    </Badge>
+                  )}
                   <Badge variant="outline" className={`${diff.color} border-0 text-xs`}>{diff.label}</Badge>
                   {!plannedEffort && !isTicketClosed(ticket) && (
                     <Badge variant="outline" className="border-amber-200 bg-amber-50 text-xs text-amber-700 dark:border-amber-500/35 dark:bg-amber-500/15 dark:text-amber-300">

@@ -792,6 +792,24 @@ function getDeadlineSortValue(ticket) {
   return Number.isFinite(ts) ? ts : Number.POSITIVE_INFINITY;
 }
 
+function getUrgencySortValue(ticket) {
+  const raw = String(ticket?.urgent_requested_at || "").trim();
+  if (!raw) return null;
+  const ts = Date.parse(raw);
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+function compareTicketUrgency(a, b) {
+  const urgencyA = getUrgencySortValue(a);
+  const urgencyB = getUrgencySortValue(b);
+  const aUrgent = urgencyA !== null;
+  const bUrgent = urgencyB !== null;
+
+  if (aUrgent !== bUrgent) return aUrgent ? -1 : 1;
+  if (aUrgent && bUrgent && urgencyA !== urgencyB) return urgencyB - urgencyA;
+  return 0;
+}
+
 function getSequenceSortValue(ticket, anchorDate = "", anchorStart = null) {
   const segments = sortSegments(getAllTicketSegments(ticket));
   const anchorDateValue = String(anchorDate || "").trim();
@@ -1071,9 +1089,11 @@ function buildTimeSchedule(devTickets, days, dev) {
   days.forEach(d => { result[d.format("YYYY-MM-DD")] = []; });
 
   // Sort by priority desc
-  const sorted = [...devTickets].sort((a, b) =>
-    getEffectivePriorityScore(b) - getEffectivePriorityScore(a)
-  );
+  const sorted = [...devTickets].sort((a, b) => {
+    const urgencyOrder = compareTicketUrgency(a, b);
+    if (urgencyOrder !== 0) return urgencyOrder;
+    return getEffectivePriorityScore(b) - getEffectivePriorityScore(a);
+  });
 
   // Track cursor per day (for sequential layout)
   const dayCursor = {};
@@ -1224,8 +1244,10 @@ export function checkScheduleConflict(
   startTime,
   endTime,
   ticketId = null,
-  dev = null
+  dev = null,
+  options = {}
 ) {
+  const allowTicketReflow = Boolean(options?.allowTicketReflow);
   const newStart = timeToDecimal(startTime);
   const newEnd = timeToDecimal(endTime);
   
@@ -1270,6 +1292,15 @@ export function checkScheduleConflict(
 
   if (conflicts.length === 0) {
     return { status: 'ok', message: 'No conflicts', suggestedSchedule: null };
+  }
+
+  if (allowTicketReflow) {
+    return {
+      status: "ok",
+      message: "Slot occupato: le altre attivita verranno ripianificate.",
+      suggestedSchedule: null,
+      conflicts,
+    };
   }
 
   const effortHours = roundHalf(newEnd - newStart);
@@ -1601,6 +1632,9 @@ export function buildWeeklyRebalanceUpdates(
     const bForcedFirst = forceFirstTicketSet.has(b.id);
     if (aForcedFirst !== bForcedFirst) return aForcedFirst ? -1 : 1;
 
+    const urgencyOrder = compareTicketUrgency(a, b);
+    if (urgencyOrder !== 0) return urgencyOrder;
+
     if (preserveExistingSequence) {
       const aForcedLast = forceLastTicketSet.has(a.id);
       const bForcedLast = forceLastTicketSet.has(b.id);
@@ -1777,6 +1811,8 @@ export function buildVisibleWeekCompactionUpdates(
   const replannableTickets = devTickets
     .filter((ticket) => (weekEffortByTicket[ticket.id] || 0) > 0)
     .sort((a, b) => {
+      const urgencyOrder = compareTicketUrgency(a, b);
+      if (urgencyOrder !== 0) return urgencyOrder;
       const priorityA = getEffectivePriorityScore(a);
       const priorityB = getEffectivePriorityScore(b);
       if (priorityB !== priorityA) return priorityB - priorityA;
@@ -1845,6 +1881,7 @@ export default function DevPipeline() {
   const [dismissedInProgressReminderIds, setDismissedInProgressReminderIds] = useState([]);
   const [showInProgressReminderList, setShowInProgressReminderList] = useState(false);
   const staleRebalanceSignatureRef = useRef("");
+  const urgentRebalanceSignatureRef = useRef("");
   const queryClient = useQueryClient();
   const { user, isTechSupervisor, isAdmin, isAnalyst } = useCurrentUser();
 
@@ -2011,6 +2048,77 @@ export default function DevPipeline() {
 
     rebalanceStaleTickets().catch(() => {
       staleRebalanceSignatureRef.current = "";
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [queryClient, selectableDevelopers, tickets]);
+
+  useEffect(() => {
+    if (selectableDevelopers.length === 0 || tickets.length === 0) return;
+
+    const todayStr = moment().format("YYYY-MM-DD");
+    const developerById = new Map(selectableDevelopers.map((dev) => [dev.id, dev]));
+    const urgentTickets = tickets
+      .filter((ticket) => {
+        if (!ticket?.urgent_requested_at) return false;
+        if (!ticket?.assignee_id || !developerById.has(ticket.assignee_id)) return false;
+        if (!isSchedulableTicket(ticket)) return false;
+        return getTicketEffort(ticket) > 0;
+      })
+      .sort((a, b) => String(a.id || "").localeCompare(String(b.id || "")));
+
+    if (urgentTickets.length === 0) return;
+
+    const urgentDeveloperIds = [...new Set(urgentTickets.map((ticket) => ticket.assignee_id).filter(Boolean))];
+    const signature = `${todayStr}:${urgentTickets
+      .map((ticket) => `${ticket.id}:${ticket.urgent_requested_at || ""}`)
+      .join(",")}`;
+    if (urgentRebalanceSignatureRef.current === signature) return;
+    urgentRebalanceSignatureRef.current = signature;
+
+    let cancelled = false;
+
+    const rebalanceUrgentTickets = async () => {
+      let movedCount = 0;
+
+      for (const developerId of urgentDeveloperIds) {
+        const dev = developerById.get(developerId) || null;
+        const latestTickets = await appClient.entities.Ticket.list();
+        const updates = buildWeeklyRebalanceUpdates(
+          latestTickets,
+          developerId,
+          dev,
+          getDynamicRebalanceOptions({
+            planningStartDate: todayStr,
+            includeTodayHoles: true,
+            preserveTodaySegments: false,
+            preserveWorkingDaysFromToday: 0,
+            preserveExistingSequence: true,
+            allowInProgressReplan: true,
+            freezeCurrentWeekSegments: false,
+          })
+        );
+
+        if (updates.length === 0) continue;
+        movedCount += updates.length;
+        await Promise.all(
+          updates.map((entry) => appClient.entities.Ticket.update(entry.id, entry.updates))
+        );
+      }
+
+      if (movedCount > 0 && !cancelled) {
+        await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+        toast({
+          title: "Urgenze riallineate",
+          description: `${movedCount} attivita ripianificate mantenendo le urgenze sopra.`,
+        });
+      }
+    };
+
+    rebalanceUrgentTickets().catch(() => {
+      urgentRebalanceSignatureRef.current = "";
     });
 
     return () => {
@@ -3129,6 +3237,7 @@ function TicketBlock({
   const status = STATUS_CONFIG[normalizedStatus] || STATUS_CONFIG.new;
   const isDeadlineSoon = ticket.deadline && moment(ticket.deadline).diff(moment(), "days") <= 2;
   const isDeadlinePast = ticket.deadline && moment(ticket.deadline).isBefore(moment());
+  const isUrgent = Boolean(ticket.urgent_requested_at);
   const isDone = isTicketClosed(ticket);
   const isPast = moment(dateStr).isBefore(moment(), "day");
 
@@ -3187,6 +3296,11 @@ function TicketBlock({
             <span className="text-[8px] font-semibold uppercase tracking-wide text-muted-foreground max-w-[40%] truncate">
               {clientName}
             </span>
+            {isUrgent && (
+              <span className="rounded border border-amber-300 bg-amber-100 px-1 py-0.5 text-[7px] font-bold uppercase tracking-wide text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/20 dark:text-amber-200">
+                Urg
+              </span>
+            )}
             <p className="text-[10px] font-semibold text-foreground truncate flex-1 leading-none">
               {ticket.title}
             </p>
@@ -3207,6 +3321,11 @@ function TicketBlock({
               <div className="flex items-center gap-1 shrink-0">
                 {isDeadlinePast && <AlertTriangle className="w-2 h-2 text-red-500" />}
                 {isDeadlineSoon && !isDeadlinePast && <AlertTriangle className="w-2 h-2 text-amber-500" />}
+                {isUrgent && (
+                  <span className="text-[7px] px-1.5 py-0.5 rounded-md border border-amber-300 bg-amber-100 font-semibold uppercase tracking-wide text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/20 dark:text-amber-200">
+                    Urgente
+                  </span>
+                )}
                 <span className={`text-[7px] px-1.5 py-0.5 rounded-md border font-semibold uppercase tracking-wide max-w-[74px] truncate ${status.color}`}>
                   {statusCompactLabel}
                 </span>
@@ -3227,6 +3346,11 @@ function TicketBlock({
                 )}
               </span>
               <div className="flex items-center gap-1 shrink-0">
+                {isUrgent && (
+                  <span className="text-[7px] px-1.5 py-0.5 rounded-md border border-amber-300 bg-amber-100 font-semibold uppercase tracking-wide text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/20 dark:text-amber-200">
+                    Urgente
+                  </span>
+                )}
                 <span className={`text-[7px] px-1.5 py-0.5 rounded-md border font-semibold uppercase tracking-wide max-w-[74px] truncate ${status.color}`}>
                   {statusCompactLabel}
                 </span>

@@ -340,8 +340,12 @@ export default function Dashboard() {
       };
     }
 
+    const inProgressSegments = newStatus === "in_progress" && ticket.assignee_id
+      ? getTicketSegments({ ...ticket, status: newStatus })
+      : [];
+
     if (newStatus === "in_progress" && ticket.assignee_id) {
-      const candidateSegments = getTicketSegments({ ...ticket, status: newStatus });
+      const candidateSegments = inProgressSegments;
       if (candidateSegments.length > 0) {
         const latestTickets = await appClient.entities.Ticket.list();
         const dev = developers.find((d) => d.id === ticket.assignee_id) || null;
@@ -355,7 +359,8 @@ export default function Dashboard() {
             decimalToTime(segment.start),
             decimalToTime(segment.end),
             ticketId,
-            dev
+            dev,
+            { allowTicketReflow: true }
           );
 
           if (conflict.status !== "ok") {
@@ -413,6 +418,25 @@ export default function Dashboard() {
                 date: nowInRome?.date || moment().format("YYYY-MM-DD"),
                 start: nowInRome?.roundedDecimal ?? 9,
               },
+            })
+        : newStatus === "in_progress"
+          ? getDynamicRebalanceOptions({
+              freezeTicketIds: [ticketId],
+              preserveWorkingDaysFromToday: 0,
+              preserveExistingSequence: true,
+              includeTodayHoles: true,
+              freezeCurrentWeekSegments: false,
+              preserveTodaySegments: false,
+              allowInProgressReplan: true,
+              planningStartDate: inProgressSegments[0]?.date || moment().format("YYYY-MM-DD"),
+              ...(inProgressSegments[0]
+                ? {
+                    manualInsertionAnchor: {
+                      date: inProgressSegments[0].date,
+                      start: inProgressSegments[0].start,
+                    },
+                  }
+                : {}),
             })
         : getDynamicRebalanceOptions();
       const updates = buildWeeklyRebalanceUpdates(
