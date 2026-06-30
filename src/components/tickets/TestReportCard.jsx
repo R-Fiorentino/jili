@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/select";
 import { toast } from "@/components/ui/use-toast";
 import { cn } from "@/lib/utils";
+import MarkdownContent from "@/components/shared/MarkdownContent";
 import {
   BarChart3,
   CalendarDays,
@@ -1425,9 +1426,9 @@ export default function TestReportCard({
               {ticket?.title || "Untitled test"}
             </h2>
             <p className="mt-4 text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Description</p>
-            <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-muted-foreground">
-              {ticket?.description || "No description available for this ticket."}
-            </p>
+            <MarkdownContent className="mt-2 text-muted-foreground" emptyText="No description available for this ticket.">
+              {ticket?.description}
+            </MarkdownContent>
           </div>
 
           <div className="rounded-2xl border border-border/70 bg-card/80 p-5 shadow-sm">

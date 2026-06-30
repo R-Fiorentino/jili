@@ -56,7 +56,8 @@ import {
   notifyWatcherAdded,
 } from "@/lib/notificationService";
 import moment from "moment";
-import ReactMarkdown from "react-markdown";
+import MarkdownContent from "../components/shared/MarkdownContent";
+import MarkdownEditor from "../components/shared/MarkdownEditor";
 
 const DAY_START = 9;
 const DAY_END = 18;
@@ -114,21 +115,6 @@ const LIVE_OPS_PENDING_BADGE_CLASS =
   "bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300";
 const LIVE_OPS_CONFIRMED_BADGE_CLASS =
   "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300";
-
-function normalizeCommentMarkdown(text = "") {
-  return String(text || "")
-    .split(/(\s+)/)
-    .map((token) => {
-      if (!/^https?:\/\/\S+$/i.test(token)) return token;
-
-      const match = token.match(/^(https?:\/\/[^\s<]+?)([.,!?;:)]*)$/i);
-      if (!match) return token;
-
-      const [, url, trailing = ""] = match;
-      return `<${url}>${trailing}`;
-    })
-    .join("");
-}
 
 function normalizeQaPreviewEntries(previewEntries = [], fallbackUrls = [], fallbackLink = "") {
   const rawEntries = Array.isArray(previewEntries) ? previewEntries : [previewEntries];
@@ -4703,19 +4689,21 @@ export default function TicketDetail() {
 
                 <div className="space-y-1.5">
                   <label className={sidebarLabelClass}>Descrizione *</label>
-                  <Textarea
+                  <MarkdownEditor
                     value={editForm.description || ""}
-                    onChange={e => setEditForm({ ...editForm, description: e.target.value })}
-                    className="min-h-[144px] resize-y text-sm leading-6"
+                    onChange={value => setEditForm({ ...editForm, description: value })}
+                    minHeightClass="min-h-[144px]"
+                    label="descrizione del ticket"
                   />
                 </div>
 
                 <div className="space-y-1.5">
                   <label className={sidebarLabelClass}>Tracciamenti richiesti</label>
-                  <Textarea
+                  <MarkdownEditor
                     value={editForm.required_tracking || ""}
-                    onChange={e => setEditForm({ ...editForm, required_tracking: e.target.value })}
-                    className="min-h-[120px] resize-y text-sm leading-6"
+                    onChange={value => setEditForm({ ...editForm, required_tracking: value })}
+                    minHeightClass="min-h-[120px]"
+                    label="tracciamenti richiesti"
                   />
                 </div>
               </section>
@@ -4847,19 +4835,21 @@ export default function TicketDetail() {
 
                   <div className="space-y-1.5">
                     <label className={sidebarLabelClass}>Note per il review</label>
-                    <Textarea
+                    <MarkdownEditor
                       value={editForm.qa_review_notes || ""}
-                      onChange={e => setEditForm({ ...editForm, qa_review_notes: e.target.value })}
-                      className="min-h-[120px] resize-y text-sm leading-6"
+                      onChange={value => setEditForm({ ...editForm, qa_review_notes: value })}
+                      minHeightClass="min-h-[120px]"
+                      label="note per il review"
                     />
                   </div>
 
                   <div className="space-y-1.5">
                     <label className={sidebarLabelClass}>Come testarlo</label>
-                    <Textarea
+                    <MarkdownEditor
                       value={editForm.qa_test_instructions || ""}
-                      onChange={e => setEditForm({ ...editForm, qa_test_instructions: e.target.value })}
-                      className="min-h-[120px] resize-y text-sm leading-6"
+                      onChange={value => setEditForm({ ...editForm, qa_test_instructions: value })}
+                      minHeightClass="min-h-[120px]"
+                      label="istruzioni di test"
                     />
                   </div>
                 </section>
@@ -5345,9 +5335,9 @@ export default function TicketDetail() {
                     <div className="space-y-2">
                       <p className={sectionEyebrowClass}>Descrizione</p>
                       <div className="rounded-2xl bg-muted/35 p-5">
-                        <div className="whitespace-pre-wrap text-[15px] leading-7 text-foreground/90">
+                        <MarkdownContent className="text-[15px] text-foreground/90">
                           {ticket.description}
-                        </div>
+                        </MarkdownContent>
                       </div>
                     </div>
                   )}
@@ -5363,9 +5353,9 @@ export default function TicketDetail() {
                     <div className="space-y-2">
                       <p className={sectionEyebrowClass}>Tracciamenti richiesti</p>
                       <div className="rounded-2xl bg-muted/35 p-5">
-                        <div className="whitespace-pre-wrap text-sm leading-6 text-foreground/85">
-                          {ticket.required_tracking || "Nessun tracking specificato."}
-                        </div>
+                        <MarkdownContent emptyText="Nessun tracking specificato.">
+                          {ticket.required_tracking}
+                        </MarkdownContent>
                       </div>
                     </div>
                     <div className="space-y-2">
@@ -5459,8 +5449,8 @@ export default function TicketDetail() {
                             {reviewPreviewSource?.qa_review_notes && (
                               <div className="min-w-0 space-y-1.5">
                                 <p className={sidebarLabelClass}>Note per il review</p>
-                                <div className="whitespace-pre-wrap rounded-2xl bg-background/80 px-4 py-3 text-sm leading-6 text-foreground/85">
-                                  {reviewPreviewSource.qa_review_notes}
+                                <div className="rounded-2xl bg-background/80 px-4 py-3">
+                                  <MarkdownContent>{reviewPreviewSource.qa_review_notes}</MarkdownContent>
                                 </div>
                               </div>
                             )}
@@ -5468,8 +5458,8 @@ export default function TicketDetail() {
                             {reviewPreviewSource?.qa_test_instructions && (
                               <div className="min-w-0 space-y-1.5">
                                 <p className={sidebarLabelClass}>Come testarlo</p>
-                                <div className="whitespace-pre-wrap rounded-2xl bg-background/80 px-4 py-3 text-sm leading-6 text-foreground/85">
-                                  {reviewPreviewSource.qa_test_instructions}
+                                <div className="rounded-2xl bg-background/80 px-4 py-3">
+                                  <MarkdownContent>{reviewPreviewSource.qa_test_instructions}</MarkdownContent>
                                 </div>
                               </div>
                             )}
@@ -5755,45 +5745,7 @@ export default function TicketDetail() {
                       </div>
                     ) : (
                       <div className="mt-1.5 overflow-hidden rounded-xl border border-border/50 bg-background/80 px-3 py-2.5">
-                        <ReactMarkdown
-                          components={{
-                            p: ({ children }) => (
-                              <p className="text-sm leading-6 text-foreground/85 [&:not(:first-child)]:mt-3">{children}</p>
-                            ),
-                            strong: ({ children }) => (
-                              <strong className="font-semibold text-foreground">{children}</strong>
-                            ),
-                            em: ({ children }) => (
-                              <em className="italic text-foreground/90">{children}</em>
-                            ),
-                            a: ({ href, children }) =>
-                              String(href || "").startsWith("mention:")
-                                ? (
-                                  <span className="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-xs font-semibold text-primary">
-                                    {children}
-                                  </span>
-                                )
-                                : (
-                                  <a
-                                    href={href}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    className="break-all font-medium text-primary underline decoration-primary/35 underline-offset-4"
-                                  >
-                                    {children}
-                                  </a>
-                                ),
-                            ul: ({ children }) => (
-                              <ul className="ml-5 list-disc space-y-1 text-sm leading-6 text-foreground/85">{children}</ul>
-                            ),
-                            ol: ({ children }) => (
-                              <ol className="ml-5 list-decimal space-y-1 text-sm leading-6 text-foreground/85">{children}</ol>
-                            ),
-                            li: ({ children }) => <li>{children}</li>,
-                          }}
-                        >
-                          {normalizeCommentMarkdown(c.text)}
-                        </ReactMarkdown>
+                        <MarkdownContent allowMentions>{c.text}</MarkdownContent>
                       </div>
                     )}
                   </div>

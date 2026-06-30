@@ -4,7 +4,6 @@ import { useQuery, useMutation } from "@tanstack/react-query";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -27,6 +26,7 @@ import { useCurrentUser } from "../components/shared/useCurrentUser";
 import ClientSelect from "../components/shared/ClientSelect";
 import { notifyClientTicketUpdate, notifyTicketAssigned } from "@/lib/notificationService";
 import { buildReferenceLinksPayload, normalizeReferenceLinks } from "../components/shared/ticketReferenceLinks";
+import MarkdownEditor from "../components/shared/MarkdownEditor";
 
 export default function CreateTicket() {
   const navigate = useNavigate();
@@ -362,21 +362,23 @@ export default function CreateTicket() {
             <div className="grid gap-4 xl:grid-cols-2">
               <div className="space-y-1.5">
                 <Label className="text-xs font-semibold text-gray-600">Descrizione *</Label>
-                <Textarea
+                <MarkdownEditor
                   value={form.description}
-                  onChange={e => update("description", e.target.value)}
+                  onChange={value => update("description", value)}
                   placeholder="Spiega obiettivo del test, cambi richiesti, contesto e aspettative operative..."
-                  className="min-h-[180px] resize-y"
+                  minHeightClass="min-h-[180px]"
+                  label="descrizione del ticket"
                 />
               </div>
 
               <div className="space-y-1.5">
                 <Label className="text-xs font-semibold text-gray-600">Tracciamenti richiesti</Label>
-                <Textarea
+                <MarkdownEditor
                   value={form.required_tracking}
-                  onChange={e => update("required_tracking", e.target.value)}
+                  onChange={value => update("required_tracking", value)}
                   placeholder="Elenca eventi, naming, parametri, dataLayer, check analytics o controlli di tracking..."
-                  className="min-h-[180px] resize-y"
+                  minHeightClass="min-h-[180px]"
+                  label="tracciamenti richiesti"
                 />
               </div>
             </div>
