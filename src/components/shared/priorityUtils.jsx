@@ -80,6 +80,22 @@ export function getActualEffortHours(ticket) {
   return Number.isFinite(actual) && actual > 0 ? actual : 0;
 }
 
+export function getWorkedEffortHours(ticket) {
+  const worked = Number(ticket?.worked_effort_hours);
+  return Number.isFinite(worked) && worked > 0 ? worked : 0;
+}
+
+export function getRemainingEffortHours(ticket) {
+  const explicitRemaining = Number(ticket?.remaining_effort_hours);
+  if (Number.isFinite(explicitRemaining) && explicitRemaining >= 0) {
+    return explicitRemaining;
+  }
+
+  const planned = getPlannedEffortHours(ticket);
+  const worked = getWorkedEffortHours(ticket);
+  return Math.max(0, planned - worked);
+}
+
 function toReportNumber(value) {
   const parsed = Number(String(value ?? "").replace(",", "."));
   return Number.isFinite(parsed) ? parsed : 0;

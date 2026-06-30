@@ -7,6 +7,8 @@ import {
   calculatePriorityScore,
   compareTicketsByPriority,
   getEffectivePriorityScore,
+  getPlannedEffortHours,
+  getWorkedEffortHours,
   getTicketWorkflowStatus,
   isClosedStatus,
   isSchedulableTicket,
@@ -224,7 +226,7 @@ function SummaryChip({ icon: Icon, label, value }) {
 export default function Dashboard() {
   const [activeTab, setActiveTab] = usePersistedState("dashboard:activeTab", "kanban");
   const queryClient = useQueryClient();
-  const { isAdmin } = useCurrentUser();
+  const { user, isAdmin } = useCurrentUser();
 
   const { data: tickets = [] } = useQuery({
     queryKey: ["tickets"],
@@ -281,6 +283,17 @@ export default function Dashboard() {
 
   const handleStatusChange = async (ticketId, newStatus, ticket) => {
     const previousStatus = normalizeTicketStatus(ticket.status);
+    if (
+      ["blocked", "new"].includes(previousStatus) &&
+      newStatus === "in_progress" &&
+      getWorkedEffortHours(ticket) > 0
+    ) {
+      toast({
+        title: "Conferma l'effort rimanente",
+        description: "Apri il ticket per controllare o modificare l'effort residuo prima di riprenderlo.",
+      });
+      return;
+    }
     const isReactivatingFromBlocked =
       previousStatus === "blocked" &&
       newStatus !== "blocked" &&
@@ -320,10 +333,21 @@ export default function Dashboard() {
     };
 
     const isCompletion = isClosedStatus(newStatus);
-    const nowInRome = isCompletion || isReactivatingFromBlocked ? getNowInRome() : null;
+    const nowInRome = isCompletion || isReactivatingFromBlocked || newStatus === "blocked"
+      ? getNowInRome()
+      : null;
     const doneSnapshot = isCompletion
       ? buildDoneScheduleSnapshot(ticket, nowInRome?.date, nowInRome?.roundedTime || nowInRome?.time)
       : null;
+    const pauseSnapshot = newStatus === "blocked" && previousStatus === "in_progress"
+      ? buildDoneScheduleSnapshot(ticket, nowInRome?.date, nowInRome?.roundedTime || nowInRome?.time)
+      : null;
+    const pauseWorkedEffort = roundHalf(Number(pauseSnapshot?.effort_hours) || 0);
+    const pauseRemainingEffort = roundHalf(
+      Math.max(0, Math.max(getPlannedEffortHours(ticket), pauseWorkedEffort) - pauseWorkedEffort)
+    );
+    const pauseSchedule = pauseSnapshot ? { ...pauseSnapshot } : null;
+    if (pauseSchedule) delete pauseSchedule.effort_hours;
 
     let doneFallback = {};
     if (isCompletion && !doneSnapshot) {
@@ -381,11 +405,23 @@ export default function Dashboard() {
     await appClient.entities.Ticket.update(ticketId, {
       status: newStatus,
       ...(newStatus === "blocked" || isReactivatingFromBlocked
+        ? pauseSchedule || (getWorkedEffortHours(ticket) > 0 && isReactivatingFromBlocked
+            ? {}
+            : {
+                scheduled_date: null,
+                start_time: null,
+                end_time: null,
+                continuation_schedule: [],
+              })
+        : {}),
+      ...(pauseSchedule
         ? {
-            scheduled_date: null,
-            start_time: null,
-            end_time: null,
-            continuation_schedule: [],
+            worked_effort_hours: pauseWorkedEffort,
+            remaining_effort_hours: pauseRemainingEffort,
+            paused_at: new Date().toISOString(),
+            paused_by: user?.email || user?.full_name || "user",
+            paused_by_id: user?.id || null,
+            paused_from_status: previousStatus,
           }
         : {}),
       ...reactivationData,

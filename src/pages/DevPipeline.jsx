@@ -13,6 +13,7 @@ import {
   STATUS_CONFIG,
   getEffectivePriorityScore,
   getPlannedEffortHours,
+  getWorkedEffortHours,
   getTicketWorkflowStatus,
   isClosedStatus,
   isSchedulableTicket,
@@ -584,6 +585,31 @@ function getAllTicketSegments(ticket) {
   return normalizeTicketSegments(segments);
 }
 
+function getWorkedTicketSegments(ticket) {
+  let remainingWorked = roundHalf(getWorkedEffortHours(ticket));
+  if (remainingWorked <= 0) return [];
+
+  const workedSegments = [];
+  for (const segment of sortSegments(getAllTicketSegments(ticket))) {
+    if (remainingWorked <= 0) break;
+    const duration = segmentDuration(segment);
+    if (duration <= 0) continue;
+
+    const workedDuration = roundHalf(Math.min(duration, remainingWorked));
+    workedSegments.push({
+      ...segment,
+      end: roundHalf(segment.start + workedDuration),
+    });
+    remainingWorked = roundHalf(remainingWorked - workedDuration);
+  }
+
+  return workedSegments;
+}
+
+function hasWorkedSchedule(ticket) {
+  return getWorkedEffortHours(ticket) > 0 && getWorkedTicketSegments(ticket).length > 0;
+}
+
 function getTicketSegmentsOnDate(ticket, dateStr) {
   return getAllTicketSegments(ticket).filter(
     (segment) => String(segment.date || "") === String(dateStr || "")
@@ -1100,7 +1126,18 @@ function buildTimeSchedule(devTickets, days, dev) {
   days.forEach(d => { dayCursor[d.format("YYYY-MM-DD")] = DAY_START; });
 
   sorted.forEach(ticket => {
-    if (isTicketBlocked(ticket)) return;
+    if (isTicketBlocked(ticket)) {
+      getWorkedTicketSegments(ticket).forEach((segment, idx) => {
+        if (!(segment.date in result)) return;
+        result[segment.date].push({
+          ticket,
+          startHour: segment.start,
+          endHour: segment.end,
+          isContinuation: idx > 0,
+        });
+      });
+      return;
+    }
 
     const effort = roundHalf(getTicketEffort(ticket) || 4);
     const hasExplicitTimes = ticket.scheduled_date && ticket.start_time && ticket.end_time;
@@ -1282,16 +1319,34 @@ export function checkScheduleConflict(
     .filter((t) =>
       t.assignee_id === devId &&
       t.id !== ticketId &&
-      isSchedulableTicket(t)
+      (isSchedulableTicket(t) || hasWorkedSchedule(t))
     )
     .flatMap((t) =>
-      getTicketSegmentsOnDate(t, scheduledDate)
+      (isTicketBlocked(t) ? getWorkedTicketSegments(t) : getTicketSegmentsOnDate(t, scheduledDate))
+        .filter((segment) => String(segment.date || "") === String(scheduledDate || ""))
         .filter((segment) => getSlotOverlap(newStart, newEnd, segment.start, segment.end) > 0)
         .map((segment) => ({ ticket: t, segment }))
     );
 
   if (conflicts.length === 0) {
     return { status: 'ok', message: 'No conflicts', suggestedSchedule: null };
+  }
+
+  const workedConflict = conflicts.find(({ ticket: conflictTicket }) =>
+    getWorkedTicketSegments(conflictTicket).some(
+      (segment) =>
+        String(segment.date || "") === String(scheduledDate || "") &&
+        getSlotOverlap(newStart, newEnd, segment.start, segment.end) > 0
+    )
+  );
+  if (workedConflict) {
+    const conflictTitle = workedConflict.ticket?.title || "un'altra task";
+    return {
+      status: "error",
+      message: `Slot gia consuntivato su ${conflictTitle}. Le ore lavorate non possono essere sovrascritte.`,
+      suggestedSchedule: null,
+      conflicts,
+    };
   }
 
   if (allowTicketReflow) {
@@ -1354,9 +1409,14 @@ export function findOptimalSchedule(
   // Build existing schedule by date
   const dateSchedule = {}; // date -> [{ start, end }]
   allTickets
-    .filter((t) => t.assignee_id === devId && isSchedulableTicket(t) && !excludedIds.has(t.id))
+    .filter((t) =>
+      t.assignee_id === devId &&
+      (isSchedulableTicket(t) || hasWorkedSchedule(t)) &&
+      !excludedIds.has(t.id)
+    )
     .forEach(t => {
-      getAllTicketSegments(t).forEach((segment) => {
+      const occupiedSegments = isTicketBlocked(t) ? getWorkedTicketSegments(t) : getAllTicketSegments(t);
+      occupiedSegments.forEach((segment) => {
         if (!dateSchedule[segment.date]) dateSchedule[segment.date] = [];
         dateSchedule[segment.date].push({
           start: segment.start,
@@ -1475,13 +1535,16 @@ export function buildWeeklyRebalanceUpdates(
   const forceLastTicketSet = new Set((forceLastTicketIds || []).filter(Boolean));
 
   const devTickets = (allTickets || []).filter(
-    (ticket) => ticket.assignee_id === devId && isSchedulableTicket(ticket)
+    (ticket) =>
+      ticket.assignee_id === devId &&
+      (isSchedulableTicket(ticket) || hasWorkedSchedule(ticket))
   );
 
   if (devTickets.length === 0) return [];
 
   const replannable = devTickets.filter(
     (ticket) =>
+      isSchedulableTicket(ticket) &&
       !frozenTicketSet.has(ticket.id) &&
       !shouldLockWholeTicket(ticket, planningStartMoment, todayMoment, { allowInProgressReplan }) &&
       getTicketEffort(ticket) > 0
@@ -1492,7 +1555,6 @@ export function buildWeeklyRebalanceUpdates(
   const replannableIds = new Set(replannable.map((ticket) => ticket.id));
   const lockedIntervalsByDate = {};
   const preservedSegmentsByTicket = {};
-  const preservedHoursByTicket = {};
   const unavailableIntervalsByDate = getDeveloperUnavailableIntervalsByDate(dev, {
     fromDate: planningStartMoment.format("YYYY-MM-DD"),
     toDate: planningStartMoment.clone().add(horizonDays, "days").format("YYYY-MM-DD"),
@@ -1515,14 +1577,15 @@ export function buildWeeklyRebalanceUpdates(
       preservedSegmentsByTicket[ticket.id] = [];
     }
     preservedSegmentsByTicket[ticket.id].push(segment);
-    preservedHoursByTicket[ticket.id] = roundHalf(
-      (preservedHoursByTicket[ticket.id] || 0) + segmentDuration(segment)
-    );
   };
 
   // PASS 1: preserve only strong/fixed segments (locks, past window, frozen rules).
   devTickets.forEach((ticket) => {
+    const workedSegments = getWorkedTicketSegments(ticket);
+    workedSegments.forEach((segment) => preserveSegment(ticket, segment, replannableIds.has(ticket.id)));
+
     const lockAllSegments =
+      isTicketBlocked(ticket) ||
       frozenTicketSet.has(ticket.id) ||
       shouldLockWholeTicket(ticket, planningStartMoment, todayMoment, { allowInProgressReplan });
     const isReplannable = replannableIds.has(ticket.id);
@@ -1680,9 +1743,11 @@ export function buildWeeklyRebalanceUpdates(
   const updates = [];
 
   sortedTickets.forEach((ticket) => {
-    const preservedSegments = sortSegments(preservedSegmentsByTicket[ticket.id] || []);
+    const preservedSegments = normalizeTicketSegments(preservedSegmentsByTicket[ticket.id] || []);
     const plannedEffort = getTicketEffort(ticket);
-    const preservedHours = roundHalf(preservedHoursByTicket[ticket.id] || 0);
+    const preservedHours = roundHalf(
+      preservedSegments.reduce((sum, segment) => sum + segmentDuration(segment), 0)
+    );
     let remaining = roundHalf(Math.max(0, plannedEffort - preservedHours));
     const allocatedSegments = [];
 

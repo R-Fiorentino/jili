@@ -24,7 +24,9 @@ import {
   getActualEffortHours,
   getEffectivePriorityScore,
   getPlannedEffortHours,
+  getRemainingEffortHours,
   getTicketWorkflowStatus,
+  getWorkedEffortHours,
   isPriorityPaused,
   isClosedStatus,
   isSchedulableTicket,
@@ -477,6 +479,44 @@ function buildDoneScheduleSnapshot(ticket, completionDate, completionTime) {
   };
 }
 
+function buildPauseScheduleSnapshot(ticket, pauseDate, pauseTime) {
+  const completedSnapshot = buildDoneScheduleSnapshot(ticket, pauseDate, pauseTime);
+  if (!completedSnapshot) return null;
+
+  const workedEffort = roundHalf(Number(completedSnapshot.effort_hours) || 0);
+  const plannedEffort = Math.max(getPlannedEffortHours(ticket), workedEffort);
+  const remainingEffort = roundHalf(Math.max(0, plannedEffort - workedEffort));
+  const schedule = { ...completedSnapshot };
+  delete schedule.effort_hours;
+
+  return {
+    schedule,
+    workedEffort,
+    remainingEffort,
+  };
+}
+
+function getWorkedScheduleSegments(ticket) {
+  let remainingWorked = roundHalf(getWorkedEffortHours(ticket));
+  if (remainingWorked <= 0) return [];
+
+  const workedSegments = [];
+  for (const segment of getTicketScheduleSegments(ticket)) {
+    if (remainingWorked <= 0) break;
+    const duration = roundHalf(segment.end - segment.start);
+    if (duration <= 0) continue;
+
+    const workedDuration = roundHalf(Math.min(duration, remainingWorked));
+    workedSegments.push({
+      ...segment,
+      end: roundHalf(segment.start + workedDuration),
+    });
+    remainingWorked = roundHalf(remainingWorked - workedDuration);
+  }
+
+  return workedSegments;
+}
+
 function getPlannedCompletionInfo(ticket) {
   const segments = getTicketScheduleSegments(ticket);
   if (segments.length > 0) {
@@ -854,6 +894,8 @@ export default function TicketDetail() {
   const [deadlineInput, setDeadlineInput] = useState("");
   const [savingDeadline, setSavingDeadline] = useState(false);
   const [inProgressConflict, setInProgressConflict] = useState(null); // { nowTime, plannedTime }
+  const [resumePauseDialog, setResumePauseDialog] = useState(null);
+  const [resumeRemainingInput, setResumeRemainingInput] = useState("");
   const [doneConflict, setDoneConflict] = useState(null); // { status, nowDate, nowTime, plannedDate, plannedTime }
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -2207,12 +2249,24 @@ export default function TicketDetail() {
   const handlePlannedEffort = async () => {
     const hours = parseFloat(plannedEffortInput);
     if (!hours || hours <= 0) return;
+    const workedHours = getWorkedEffortHours(ticket);
+    if (workedHours > 0 && hours < workedHours) {
+      toast({
+        variant: "destructive",
+        title: "Effort inferiore al lavoro svolto",
+        description: `Sono gia state registrate ${workedHours}h. Imposta un totale almeno pari alle ore lavorate.`,
+      });
+      return;
+    }
 
     const client = clients.find(c => c.id === ticket.client_id);
     const newScore = calculatePriorityScore({ ...ticket, proposed_effort: hours }, client, config);
 
     const updates = {
       proposed_effort: hours,
+      ...(workedHours > 0
+        ? { remaining_effort_hours: roundHalf(Math.max(0, hours - workedHours)) }
+        : {}),
       priority_score: newScore,
       planned_effort_locked: true,
     };
@@ -2547,6 +2601,7 @@ export default function TicketDetail() {
       extraData = {},
       auditAction = "status_change",
       auditDetails = "",
+      remainingEffortHours = null,
     } = options;
 
     const nowInfo = getNowInRome();
@@ -2578,6 +2633,7 @@ export default function TicketDetail() {
         }
       : {};
     const timeData = {};
+    const lifecycleData = {};
     let resolvedCompletionDateForRebalance = null;
     let resolvedCompletionTimeForRebalance = null;
 
@@ -2588,7 +2644,13 @@ export default function TicketDetail() {
         ? moment().format("YYYY-MM-DD")
         : ticket.scheduled_date || moment().format("YYYY-MM-DD");
       const dev = developers.find((d) => d.id === ticket.assignee_id);
-      const effortToPlan = Number(getPlannedEffortHours(ticket) || 0);
+      const normalizedRemainingEffort = normalizeEffortHours(remainingEffortHours);
+      const workedEffort = getWorkedEffortHours(ticket);
+      const isResumingWorkedTicket =
+        workedEffort > 0 && ["blocked", "new"].includes(previousStatus);
+      const effortToPlan = isResumingWorkedTicket
+        ? Number(normalizedRemainingEffort || getRemainingEffortHours(ticket) || 0)
+        : Number(getPlannedEffortHours(ticket) || 0);
       const selectedStartDecimal = timeToDecimal(selectedStartTime);
       const unavailableIntervals = getDeveloperUnavailableIntervalsByDate(dev)[selectedStartDate] || [];
       const hasStartConflict = unavailableIntervals.some(
@@ -2613,9 +2675,22 @@ export default function TicketDetail() {
         effortToPlan,
         dev
       );
+      const activeScheduleSegments = splitSchedule
+        ? getTicketScheduleSegments(splitSchedule)
+        : [];
 
       if (splitSchedule) {
-        Object.assign(timeData, splitSchedule);
+        if (isResumingWorkedTicket) {
+          Object.assign(
+            timeData,
+            schedulePayloadFromSegments([
+              ...getWorkedScheduleSegments(ticket),
+              ...activeScheduleSegments,
+            ])
+          );
+        } else {
+          Object.assign(timeData, splitSchedule);
+        }
       } else {
         timeData.scheduled_date = selectedStartDate;
         timeData.start_time = selectedStartTime;
@@ -2623,11 +2698,36 @@ export default function TicketDetail() {
         timeData.continuation_schedule = [];
       }
 
-      const candidateSegments = getTicketScheduleSegments({
-        ...ticket,
-        ...timeData,
-        status: newStatus,
-      });
+      if (isResumingWorkedTicket) {
+        const nextRemainingEffort = Number(normalizedRemainingEffort || effortToPlan);
+        const nextPlannedEffort = roundHalf(workedEffort + nextRemainingEffort);
+        Object.assign(lifecycleData, {
+          proposed_effort: nextPlannedEffort,
+          remaining_effort_hours: nextRemainingEffort,
+          resumed_at: new Date().toISOString(),
+          resumed_by: user?.email || user?.full_name || "user",
+          resumed_by_id: user?.id || null,
+          priority_score: calculatePriorityScore(
+            {
+              ...ticket,
+              status: newStatus,
+              missing_required_data: false,
+              priority_override: null,
+              proposed_effort: nextPlannedEffort,
+            },
+            client,
+            config
+          ),
+        });
+      }
+
+      const candidateSegments = isResumingWorkedTicket
+        ? activeScheduleSegments
+        : getTicketScheduleSegments({
+            ...ticket,
+            ...timeData,
+            status: newStatus,
+          });
       if (candidateSegments.length > 0) {
         const latestTickets = await appClient.entities.Ticket.list();
         for (const segment of candidateSegments) {
@@ -2658,16 +2758,34 @@ export default function TicketDetail() {
       }
     }
     if (newStatus === "blocked") {
-      timeData.scheduled_date = null;
-      timeData.start_time = null;
-      timeData.end_time = null;
-      timeData.continuation_schedule = [];
+      const pauseSnapshot = previousStatus === "in_progress"
+        ? buildPauseScheduleSnapshot(ticket, nowInfo.date, nowInfo.roundedTime || nowInfo.time)
+        : null;
+
+      if (pauseSnapshot) {
+        Object.assign(timeData, pauseSnapshot.schedule);
+        Object.assign(lifecycleData, {
+          worked_effort_hours: pauseSnapshot.workedEffort,
+          remaining_effort_hours: pauseSnapshot.remainingEffort,
+          paused_at: new Date().toISOString(),
+          paused_by: user?.email || user?.full_name || "user",
+          paused_by_id: user?.id || null,
+          paused_from_status: previousStatus,
+        });
+      } else {
+        timeData.scheduled_date = null;
+        timeData.start_time = null;
+        timeData.end_time = null;
+        timeData.continuation_schedule = [];
+      }
     }
     if (isReactivatingFromBlocked && newStatus !== "in_progress") {
-      timeData.scheduled_date = null;
-      timeData.start_time = null;
-      timeData.end_time = null;
-      timeData.continuation_schedule = [];
+      if (getWorkedEffortHours(ticket) <= 0) {
+        timeData.scheduled_date = null;
+        timeData.start_time = null;
+        timeData.end_time = null;
+        timeData.continuation_schedule = [];
+      }
     }
     const isCompletionStatus = isClosedStatus(newStatus);
     const wasCompletionStatus = isTicketClosed(ticket);
@@ -2717,7 +2835,7 @@ export default function TicketDetail() {
       : (timeData.end_time || null);
 
     await updateMutation.mutateAsync({
-      data: { status: newStatus, ...timeData, ...reactivationData, ...extraData },
+      data: { status: newStatus, ...timeData, ...reactivationData, ...lifecycleData, ...extraData },
       auditAction,
       auditDetails:
         auditDetails ||
@@ -2885,6 +3003,18 @@ export default function TicketDetail() {
       }
 
       await completeLiveOpsTransition();
+      return;
+    }
+
+    if (
+      newStatus === "in_progress" &&
+      ["blocked", "new"].includes(normalizeTicketStatus(ticket.status)) &&
+      getWorkedEffortHours(ticket) > 0
+    ) {
+      const workedEffort = getWorkedEffortHours(ticket);
+      const remainingEffort = getRemainingEffortHours(ticket);
+      setResumeRemainingInput(String(remainingEffort > 0 ? remainingEffort : 0.5));
+      setResumePauseDialog({ workedEffort, remainingEffort });
       return;
     }
 
@@ -3510,6 +3640,8 @@ export default function TicketDetail() {
   const effectivePriority = getEffectivePriorityScore(ticket);
   const plannedEffort = getPlannedEffortHours(ticket);
   const actualEffort = getActualEffortHours(ticket);
+  const workedEffort = getWorkedEffortHours(ticket);
+  const remainingEffort = getRemainingEffortHours(ticket);
   const priorityPaused = isPriorityPaused(ticket);
   const ticketBlocked = isTicketBlocked(ticket);
   const scheduleSlipCount = Number(ticket.schedule_slip_count) || 0;
@@ -3987,6 +4119,25 @@ export default function TicketDetail() {
     );
     const currentScheduleSegments = getTicketScheduleSegments(ticket);
     const anchorSegment = currentScheduleSegments[0] || null;
+    const nowInfo = getNowInRome();
+    const pauseSnapshot = nextPaused && currentStatus === "in_progress"
+      ? buildPauseScheduleSnapshot(ticket, nowInfo.date, nowInfo.roundedTime || nowInfo.time)
+      : null;
+    const scheduleUpdate = nextPaused
+      ? pauseSnapshot?.schedule || {
+          scheduled_date: null,
+          start_time: null,
+          end_time: null,
+          continuation_schedule: [],
+        }
+      : getWorkedEffortHours(ticket) > 0
+        ? {}
+        : {
+            scheduled_date: null,
+            start_time: null,
+            end_time: null,
+            continuation_schedule: [],
+          };
 
     await updateMutation.mutateAsync({
       data: {
@@ -3997,10 +4148,17 @@ export default function TicketDetail() {
         priority_override: nextPaused ? 0 : null,
         priority_score: nextPriorityScore,
         status: nextStatus,
-        scheduled_date: null,
-        start_time: null,
-        end_time: null,
-        continuation_schedule: [],
+        ...scheduleUpdate,
+        ...(pauseSnapshot
+          ? {
+              worked_effort_hours: pauseSnapshot.workedEffort,
+              remaining_effort_hours: pauseSnapshot.remainingEffort,
+              paused_at: new Date().toISOString(),
+              paused_by: user?.email || user?.full_name || "developer",
+              paused_by_id: user?.id || null,
+              paused_from_status: currentStatus,
+            }
+          : {}),
       },
       auditAction: nextPaused ? "missing_data_reported" : "missing_data_cleared",
       auditDetails: nextPaused
@@ -4067,7 +4225,6 @@ export default function TicketDetail() {
         await queryClient.invalidateQueries({ queryKey: ["ticket", ticketId] });
         await queryClient.invalidateQueries({ queryKey: ["tickets"] });
       } else {
-        const nowInfo = getNowInRome();
         await applyRebalanceForDevelopers([ticket.assignee_id], {
           preserveWorkingDaysFromToday: 0,
           preserveExistingSequence: false,
@@ -4366,6 +4523,76 @@ export default function TicketDetail() {
 
   return (
     <div className="mx-auto max-w-7xl space-y-6">
+      {resumePauseDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-border/70 bg-card p-6 shadow-xl">
+            <div className="flex items-start gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-violet-100 dark:bg-violet-500/15">
+                <Clock className="h-5 w-5 text-violet-600 dark:text-violet-300" />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-foreground">Riprendi ticket in pausa</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  Le {resumePauseDialog.workedEffort}h gia lavorate restano bloccate nel calendario. Verra pianificato solo l&apos;effort residuo.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 rounded-xl border border-border/70 bg-muted/25 p-4">
+              <div className="flex items-center justify-between gap-3 text-xs">
+                <span className="text-muted-foreground">Effort gia lavorato</span>
+                <span className="font-semibold text-foreground">{resumePauseDialog.workedEffort}h</span>
+              </div>
+              <div className="mt-3 space-y-1.5">
+                <label className={sidebarLabelClass}>Effort rimanente (h)</label>
+                <Input
+                  type="number"
+                  min="0.5"
+                  step="0.5"
+                  value={resumeRemainingInput}
+                  onChange={(event) => setResumeRemainingInput(event.target.value)}
+                  className="h-10"
+                  autoFocus
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  Stima precedente: {resumePauseDialog.remainingEffort}h. Puoi correggerla prima di ripartire.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setResumePauseDialog(null)}
+              >
+                Annulla
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                disabled={!normalizeEffortHours(resumeRemainingInput) || updateMutation.isPending}
+                onClick={async () => {
+                  const nextRemaining = normalizeEffortHours(resumeRemainingInput);
+                  if (!nextRemaining) return;
+                  const nowInfo = getNowInRome();
+                  setResumePauseDialog(null);
+                  await finalizeStatusChange("in_progress", {
+                    overrideStartTime: nowInfo.roundedTime || nowInfo.time,
+                    remainingEffortHours: nextRemaining,
+                    auditAction: "ticket_resumed",
+                    auditDetails: `Ticket resumed with ${nextRemaining}h remaining after ${resumePauseDialog.workedEffort}h worked`,
+                  });
+                }}
+              >
+                Riprendi e ripianifica
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* In-progress time conflict dialog */}
       {inProgressConflict && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
@@ -6353,6 +6580,18 @@ export default function TicketDetail() {
                 )}
                 {plannedEffort > 0 && (
                   <p className="text-[11px] text-gray-500 mt-1">Attuale: {plannedEffort}h</p>
+                )}
+                {workedEffort > 0 && (
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    <div className="rounded-xl bg-muted/45 px-3 py-2">
+                      <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Lavorato</p>
+                      <p className="mt-0.5 text-sm font-semibold text-foreground">{workedEffort}h</p>
+                    </div>
+                    <div className="rounded-xl bg-muted/45 px-3 py-2">
+                      <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Rimanente</p>
+                      <p className="mt-0.5 text-sm font-semibold text-foreground">{remainingEffort}h</p>
+                    </div>
+                  </div>
                 )}
               </div>
 
