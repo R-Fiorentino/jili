@@ -1,8 +1,11 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import { appClient } from "@/api/appClient";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { LayoutGrid, List, Users, Ticket, Clock, Search, CheckCircle2, Zap } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { AlertTriangle, LayoutGrid, List, Users, Ticket, Clock, Search, CheckCircle2, Zap } from "lucide-react";
+import { Link } from "react-router-dom";
+import { createPageUrl } from "@/utils";
 import {
   calculatePriorityScore,
   compareTicketsByPriority,
@@ -225,6 +228,7 @@ function SummaryChip({ icon: Icon, label, value }) {
 
 export default function Dashboard() {
   const [activeTab, setActiveTab] = usePersistedState("dashboard:activeTab", "kanban");
+  const [inProgressBlockDialog, setInProgressBlockDialog] = useState(null);
   const queryClient = useQueryClient();
   const { user, isAdmin } = useCurrentUser();
 
@@ -281,8 +285,28 @@ export default function Dashboard() {
     };
   }, [tickets, developers]);
 
+  const findConcurrentInProgressTicket = (ticket, sourceTickets = tickets) => {
+    if (!ticket?.assignee_id) return null;
+    return (sourceTickets || []).find(
+      (entry) =>
+        entry?.id &&
+        entry.id !== ticket.id &&
+        entry.assignee_id === ticket.assignee_id &&
+        normalizeTicketStatus(entry.status) === "in_progress"
+    ) || null;
+  };
+
   const handleStatusChange = async (ticketId, newStatus, ticket) => {
     const previousStatus = normalizeTicketStatus(ticket.status);
+    if (newStatus === "in_progress") {
+      const latestTicketsForStatus = await appClient.entities.Ticket.list();
+      const activeInProgressTicket = findConcurrentInProgressTicket(ticket, latestTicketsForStatus);
+      if (activeInProgressTicket) {
+        setInProgressBlockDialog({ ticket, activeTicket: activeInProgressTicket });
+        return;
+      }
+    }
+
     if (
       ["blocked", "new"].includes(previousStatus) &&
       newStatus === "in_progress" &&
@@ -502,6 +526,72 @@ export default function Dashboard() {
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-6" data-tour="dashboard-page">
+      {inProgressBlockDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-border/70 bg-card p-6 shadow-xl">
+            <div className="flex items-start gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-violet-100 dark:bg-violet-500/15">
+                <AlertTriangle className="h-5 w-5 text-violet-600 dark:text-violet-300" />
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-foreground">Ticket gia in progress</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  Non puoi avere piu ticket in progress contemporaneamente per lo stesso developer.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 rounded-xl border border-violet-200 bg-violet-50/70 p-4 dark:border-violet-500/30 dark:bg-violet-500/10">
+              {(() => {
+                const activeTicket = inProgressBlockDialog.activeTicket;
+                const segments = getTicketSegments(activeTicket);
+                const lastSegment = segments[segments.length - 1] || null;
+                const plannedEnd = lastSegment
+                  ? `${moment(lastSegment.date, "YYYY-MM-DD", true).isValid() ? moment(lastSegment.date, "YYYY-MM-DD").format("DD/MM") : lastSegment.date} ${decimalToTime(lastSegment.end)}`
+                  : "";
+
+                return (
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-full border border-violet-200 bg-violet-100 px-2 py-0.5 text-[10px] font-semibold text-violet-800 dark:border-violet-500/35 dark:bg-violet-500/15 dark:text-violet-200">
+                        In progress
+                      </span>
+                      <span className="text-[11px] font-medium text-muted-foreground">
+                        {activeTicket.client_name || "Cliente non indicato"}
+                      </span>
+                    </div>
+                    <p className="mt-2 truncate text-sm font-semibold text-foreground">
+                      {activeTicket.title}
+                    </p>
+                    {plannedEnd && (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Fine prevista: {plannedEnd}
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+
+            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setInProgressBlockDialog(null)}
+              >
+                Chiudi
+              </Button>
+              <Button asChild size="sm" onClick={() => setInProgressBlockDialog(null)}>
+                <Link to={`${createPageUrl("TicketDetail")}?id=${inProgressBlockDialog.activeTicket.id}&from=dashboard`}>
+                  Apri ticket attivo
+                </Link>
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 min-h-0 flex flex-col" data-tour="dashboard-workbench">
         <TabsList className="w-fit self-start" data-tour="dashboard-tabs">
           <TabsTrigger value="kanban" className="gap-1.5 text-xs">

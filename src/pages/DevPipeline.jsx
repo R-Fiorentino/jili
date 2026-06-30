@@ -4,15 +4,19 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { ChevronLeft, ChevronRight, AlertTriangle, Clock, Check, FileDown, SlidersHorizontal } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, AlertTriangle, Clock, Check, FileDown, Loader2, PauseCircle, Pencil, Play, SlidersHorizontal } from "lucide-react";
 import { toast } from "@/components/ui/use-toast";
 import { Link, useSearchParams } from "react-router-dom";
 import { createPageUrl, isDeveloperLikeRole } from "@/utils";
 import {
+  DEFAULT_CONFIG,
   STATUS_CONFIG,
+  calculatePriorityScore,
   getEffectivePriorityScore,
   getPlannedEffortHours,
+  getRemainingEffortHours,
   getWorkedEffortHours,
   getTicketWorkflowStatus,
   isClosedStatus,
@@ -25,6 +29,11 @@ import { useCurrentUser } from "../components/shared/useCurrentUser";
 import usePersistedState from "../components/shared/usePersistedState";
 import moment from "moment";
 import { cn } from "@/lib/utils";
+import {
+  areBrowserNotificationsEnabled,
+  getBrowserNotificationPermission,
+  showBrowserNotification,
+} from "@/lib/browserNotifications";
 import {
   normalizeRecurringAvailabilityRule,
   recurringRuleMatchesDate,
@@ -45,6 +54,8 @@ const DESKTOP_HOUR_COL_WIDTH = 34;
 const DESKTOP_GRID_TEMPLATE = `${DESKTOP_DEV_COL_WIDTH}px ${DESKTOP_HOUR_COL_WIDTH}px repeat(5, minmax(0, 1fr))`;
 const DESKTOP_GRID_MIN_WIDTH = 1100;
 export const DEFAULT_REBALANCE_HORIZON_DAYS = 90;
+const IN_PROGRESS_DEADLINE_WARNING_MINUTES = 15;
+const DEADLINE_WARNING_STORAGE_KEY_PREFIX = "dev_pipeline:deadline-warning-seen";
 const DEFAULT_CLIENT_COLOR = "#64748b";
 const NO_CLIENT_FILTER_ID = "__no_client__";
 const CLIENT_COLOR_PALETTE = [
@@ -68,6 +79,13 @@ const WEEKDAY_SHORT_IT = {
   6: "Sab",
   7: "Dom",
 };
+const PIPELINE_STATUS_ACTIONS = [
+  { value: "new", label: "New" },
+  { value: "in_progress", label: "In progress" },
+  { value: "qa_review", label: "QA" },
+  { value: "blocked", label: "Pausa" },
+  { value: "done", label: "Done" },
+];
 
 function buildTicketDetailUrl(ticketId, developerId = "") {
   const params = new URLSearchParams({
@@ -76,6 +94,27 @@ function buildTicketDetailUrl(ticketId, developerId = "") {
   });
   if (developerId) params.set("dev", developerId);
   return `${createPageUrl("TicketDetail")}?${params.toString()}`;
+}
+
+function getDeadlineWarningStorageKey(userId) {
+  return `${DEADLINE_WARNING_STORAGE_KEY_PREFIX}:${userId || "anonymous"}`;
+}
+
+function readStoredStringList(key) {
+  if (typeof window === "undefined" || !key) return [];
+
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(key) || "[]");
+    return Array.isArray(parsed) ? parsed.filter(Boolean).map(String) : [];
+  } catch (error) {
+    return [];
+  }
+}
+
+function writeStoredStringList(key, values = []) {
+  if (typeof window === "undefined" || !key) return;
+  const normalized = [...new Set((values || []).filter(Boolean).map(String))].slice(-250);
+  window.localStorage.setItem(key, JSON.stringify(normalized));
 }
 
 function FilterChip({
@@ -104,6 +143,98 @@ function FilterChip({
     >
       {children}
     </button>
+  );
+}
+
+function PipelineStatusMenu({
+  ticket,
+  disabled = false,
+  onStatusChange,
+  compact = false,
+  label = "",
+  className = "",
+}) {
+  const [open, setOpen] = useState(false);
+  const currentStatus = getTicketWorkflowStatus(ticket);
+  const currentConfig = STATUS_CONFIG[currentStatus] || STATUS_CONFIG.new;
+  const triggerLabel = label || currentConfig.label;
+  const availableActions = PIPELINE_STATUS_ACTIONS.filter(
+    (option) => option.value !== currentStatus && STATUS_CONFIG[option.value]
+  );
+
+  return (
+    <Popover open={open} onOpenChange={(nextOpen) => !disabled && setOpen(nextOpen)}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          title="Cambia stato"
+          disabled={disabled}
+          onClick={(event) => {
+            event.stopPropagation();
+          }}
+          className={cn(
+            "inline-flex shrink-0 items-center gap-1 rounded-md border font-semibold uppercase tracking-wide transition-[background-color,border-color,color,box-shadow,opacity]",
+            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/80 focus-visible:ring-offset-1 disabled:pointer-events-none disabled:opacity-65",
+            currentConfig.color,
+            compact
+              ? "max-w-[82px] px-1.5 py-0.5 text-[7px]"
+              : "max-w-[120px] px-1.5 py-0.5 text-[9px]",
+            className
+          )}
+        >
+          <span className="min-w-0 truncate">{triggerLabel}</span>
+          {disabled ? (
+            <Loader2 className={cn("shrink-0 animate-spin", compact ? "h-2.5 w-2.5" : "h-3 w-3")} />
+          ) : (
+            <Pencil
+              className={cn(
+                "shrink-0 transition-opacity",
+                open ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
+                compact ? "h-2.5 w-2.5" : "h-3 w-3"
+              )}
+            />
+          )}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="end"
+        sideOffset={6}
+        onClick={(event) => event.stopPropagation()}
+        className="z-[70] w-52 rounded-2xl border-border/70 bg-card/95 p-2 shadow-[var(--shadow-hover)]"
+      >
+        <div className="mb-1.5 flex items-center justify-between gap-2 px-1">
+          <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+            Stato
+          </span>
+          <span className={cn("rounded-full border px-2 py-0.5 text-[10px] font-semibold", currentConfig.color)}>
+            {currentConfig.label}
+          </span>
+        </div>
+        <div className="space-y-1">
+          {availableActions.map((option) => {
+            const optionConfig = STATUS_CONFIG[option.value] || STATUS_CONFIG.new;
+            return (
+              <button
+                key={option.value}
+                type="button"
+                disabled={disabled}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setOpen(false);
+                  onStatusChange?.(ticket, option.value);
+                }}
+                className="flex w-full items-center justify-between gap-2 rounded-xl border border-transparent px-2.5 py-2 text-left text-xs font-semibold text-foreground transition-colors hover:border-border/70 hover:bg-muted/45 disabled:pointer-events-none disabled:opacity-60"
+              >
+                <span>{option.label}</span>
+                <span className={cn("rounded-full border px-2 py-0.5 text-[10px]", optionConfig.color)}>
+                  {optionConfig.label}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -427,6 +558,12 @@ function ceilHalf(h) {
   return Math.ceil(h * 2) / 2;
 }
 
+function normalizeEffortHours(value) {
+  const parsed = Number(String(value || "").replace(",", "."));
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.max(0.5, roundHalf(parsed));
+}
+
 // Get current time in Europe/Rome timezone as decimal hours
 function getCurrentTimeDecimal() {
   const now = new Date();
@@ -470,6 +607,30 @@ function decimalToTime(dec) {
   const h = Math.floor(dec);
   const m = Math.round((dec - h) * 60);
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function getNowInRome() {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("it-IT", {
+    timeZone: "Europe/Rome",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(now);
+
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const date = `${byType.year}-${byType.month}-${byType.day}`;
+  const time = `${byType.hour}:${byType.minute}`;
+  const decimalRaw = timeToDecimal(time);
+  const decimalRoundedUp = Number.isFinite(decimalRaw)
+    ? Math.min(DAY_END, ceilHalf(decimalRaw))
+    : null;
+  const roundedTime = Number.isFinite(decimalRoundedUp) ? decimalToTime(decimalRoundedUp) : time;
+
+  return { date, time, decimal: decimalRaw, roundedTime, roundedDecimal: decimalRoundedUp };
 }
 
 function normalizeIntervals(intervals) {
@@ -711,6 +872,107 @@ function getVisibleDoneSegments(ticket) {
   }
 
   return segments;
+}
+
+function buildDoneScheduleSnapshot(ticket, completionDate, completionTime) {
+  const completionDecimalRaw = timeToDecimal(completionTime);
+  const completionDecimal = Number.isFinite(completionDecimalRaw)
+    ? Math.min(DAY_END, ceilHalf(completionDecimalRaw))
+    : null;
+  if (!completionDate || !Number.isFinite(completionDecimal)) return null;
+
+  const sourceSegments = getAllTicketSegments(ticket);
+  if (sourceSegments.length === 0) return null;
+
+  const completedSegments = [];
+
+  for (const segment of sourceSegments) {
+    if (segment.date < completionDate) {
+      completedSegments.push(segment);
+      continue;
+    }
+
+    if (segment.date > completionDate) break;
+    if (completionDecimal <= segment.start) break;
+
+    const cappedEnd = roundHalf(Math.min(segment.end, completionDecimal));
+    if (cappedEnd > segment.start) {
+      completedSegments.push({
+        ...segment,
+        end: cappedEnd,
+      });
+    }
+
+    if (completionDecimal < segment.end) break;
+  }
+
+  const completedSameDay = completedSegments.filter((segment) => segment.date === completionDate);
+  if (completedSameDay.length > 0) {
+    const lastEnd = Math.max(...completedSameDay.map((segment) => segment.end));
+    const extendedEnd = roundHalf(Math.min(DAY_END, completionDecimal));
+    if (extendedEnd > lastEnd) {
+      completedSegments.push({
+        date: completionDate,
+        start: lastEnd,
+        end: extendedEnd,
+      });
+    }
+  }
+
+  if (completedSegments.length === 0) return null;
+
+  const effort = roundHalf(
+    completedSegments.reduce((sum, segment) => sum + segmentDuration(segment), 0)
+  );
+
+  return {
+    ...schedulePayloadFromSegments(completedSegments),
+    effort_hours: effort > 0 ? effort : undefined,
+  };
+}
+
+function buildPauseScheduleSnapshot(ticket, pauseDate, pauseTime) {
+  const completedSnapshot = buildDoneScheduleSnapshot(ticket, pauseDate, pauseTime);
+  if (!completedSnapshot) return null;
+
+  const workedEffort = roundHalf(Number(completedSnapshot.effort_hours) || 0);
+  const plannedEffort = Math.max(getPlannedEffortHours(ticket), workedEffort);
+  const remainingEffort = roundHalf(Math.max(0, plannedEffort - workedEffort));
+  const schedule = { ...completedSnapshot };
+  delete schedule.effort_hours;
+
+  return {
+    schedule,
+    workedEffort,
+    remainingEffort,
+  };
+}
+
+function getPlannedCompletionInfo(ticket) {
+  const segments = getAllTicketSegments(ticket);
+  if (segments.length > 0) {
+    const last = segments[segments.length - 1];
+    return {
+      date: last.date,
+      time: decimalToTime(last.end),
+    };
+  }
+
+  const fallbackDate = ticket?.scheduled_date ? String(ticket.scheduled_date) : null;
+  const fallbackEnd = timeToDecimal(ticket?.end_time);
+  if (!fallbackDate || !Number.isFinite(fallbackEnd)) return null;
+
+  return {
+    date: fallbackDate,
+    time: decimalToTime(roundHalf(fallbackEnd)),
+  };
+}
+
+function formatDateTimeLabel(dateStr, timeStr) {
+  const dateLabel = moment(dateStr, "YYYY-MM-DD", true).isValid()
+    ? moment(dateStr, "YYYY-MM-DD").format("DD/MM")
+    : dateStr;
+  return `${dateLabel} ${timeStr || ""}`.trim();
 }
 
 function shouldLockWholeTicket(
@@ -962,6 +1224,96 @@ function schedulePayloadFromSegments(segments) {
   };
 }
 
+function buildInProgressSchedule(startDate, startTime, effortHours, dev = null) {
+  const totalEffort = roundHalf(Number(effortHours) || 0);
+  if (totalEffort <= 0) return null;
+
+  const safeStartDate = moment(startDate, "YYYY-MM-DD", true).isValid()
+    ? moment(startDate, "YYYY-MM-DD", true).format("YYYY-MM-DD")
+    : moment().format("YYYY-MM-DD");
+  const unavailableIntervalsByDate = getDeveloperUnavailableIntervalsByDate(dev, {
+    fromDate: safeStartDate,
+    toDate: moment(safeStartDate).add(45, "days").format("YYYY-MM-DD"),
+  });
+
+  let remaining = totalEffort;
+  const firstDay = moment(startDate, "YYYY-MM-DD", true);
+  let cursor = firstDay.isValid() ? firstDay.startOf("day") : moment().startOf("day");
+  let dayStart = timeToDecimal(startTime);
+  if (!Number.isFinite(dayStart)) dayStart = DAY_START;
+
+  const segments = [];
+
+  for (let i = 0; i < 45 && remaining > 0; i++) {
+    const dateStr = cursor.format("YYYY-MM-DD");
+    const isWeekday = cursor.isoWeekday() <= 5;
+
+    if (isWeekday && !isDeveloperFullyUnavailableDay(dev, dateStr)) {
+      const effectiveStart = i === 0 ? dayStart : DAY_START;
+      const clampedStart = Math.max(DAY_START, effectiveStart);
+
+      if (clampedStart < DAY_END) {
+        const occupied = normalizeIntervals([
+          ...(unavailableIntervalsByDate[dateStr] || []),
+          { start: LUNCH_START, end: LUNCH_END },
+        ]);
+
+        const windows = [];
+        let pointer = clampedStart;
+        occupied.forEach((interval) => {
+          const start = Math.max(clampedStart, interval.start);
+          const end = Math.min(DAY_END, interval.end);
+          if (start > pointer) {
+            windows.push({ start: pointer, end: start });
+          }
+          if (end > pointer) {
+            pointer = end;
+          }
+        });
+        if (pointer < DAY_END) {
+          windows.push({ start: pointer, end: DAY_END });
+        }
+
+        for (const window of windows) {
+          const windowStart = roundHalf(window.start);
+          const windowEnd = roundHalf(window.end);
+          const available = roundHalf(windowEnd - windowStart);
+          if (available <= 0) continue;
+
+          const allocated = roundHalf(Math.min(available, remaining));
+          if (allocated <= 0) continue;
+
+          segments.push({
+            date: dateStr,
+            start_time: decimalToTime(windowStart),
+            end_time: decimalToTime(windowStart + allocated),
+          });
+
+          remaining = roundHalf(remaining - allocated);
+          if (remaining <= 0) break;
+        }
+      }
+    }
+
+    cursor = cursor.add(1, "day");
+    dayStart = DAY_START;
+  }
+
+  if (segments.length === 0) return null;
+
+  const [first, ...continuation] = segments;
+  return {
+    scheduled_date: first.date,
+    start_time: first.start_time,
+    end_time: first.end_time,
+    continuation_schedule: continuation.map((segment) => ({
+      date: segment.date,
+      start_time: segment.start_time,
+      end_time: segment.end_time,
+    })),
+  };
+}
+
 function normalizeScheduleForCompare(ticket) {
   const continuation = Array.isArray(ticket?.continuation_schedule)
     ? ticket.continuation_schedule.map((slot) => ({
@@ -1099,6 +1451,38 @@ function getInProgressReminderInfo(ticket, nowDecimal = currentTimeDecimal()) {
   }
 
   return null;
+}
+
+function getInProgressDeadlineWarningInfo(
+  ticket,
+  nowDecimal = currentTimeDecimal(),
+  todayStr = moment().format("YYYY-MM-DD")
+) {
+  if (normalizeTicketStatus(ticket?.status) !== "in_progress") return null;
+
+  const segments = sortSegments(getAllTicketSegments(ticket));
+  const lastSegment = segments[segments.length - 1] || null;
+  if (!lastSegment) return null;
+
+  const lastDate = String(lastSegment.date || "");
+  if (lastDate !== todayStr) return null;
+
+  const minutesRemaining = Math.round((Number(lastSegment.end) - Number(nowDecimal)) * 60);
+  if (minutesRemaining <= 0 || minutesRemaining > IN_PROGRESS_DEADLINE_WARNING_MINUTES) return null;
+
+  const endTime = decimalToTime(lastSegment.end);
+  return {
+    date: lastDate,
+    endTime,
+    endDecimal: Number(lastSegment.end),
+    minutesRemaining,
+    plannedEndLabel: `${lastDate} ${endTime}`,
+  };
+}
+
+function getDeadlineWarningKey(ticket, info) {
+  if (!ticket?.id || !info) return "";
+  return `${ticket.id}:${info.date}:${info.endTime}`;
 }
 
 /**
@@ -1945,6 +2329,18 @@ export default function DevPipeline() {
   const [selectedClientIds, setSelectedClientIds] = usePersistedState("dev-pipeline:selectedClientIds", null);
   const [dismissedInProgressReminderIds, setDismissedInProgressReminderIds] = useState([]);
   const [showInProgressReminderList, setShowInProgressReminderList] = useState(false);
+  const [showPausedTicketList, setShowPausedTicketList] = useState(false);
+  const [resumePausedTicketDialog, setResumePausedTicketDialog] = useState(null);
+  const [resumePausedRemainingInput, setResumePausedRemainingInput] = useState("");
+  const [resumingPausedTicketId, setResumingPausedTicketId] = useState("");
+  const [deadlineWarningDialog, setDeadlineWarningDialog] = useState(null);
+  const [deadlineExtensionInput, setDeadlineExtensionInput] = useState("0.5");
+  const [updatingDeadlineWarning, setUpdatingDeadlineWarning] = useState(false);
+  const [seenDeadlineWarningKeys, setSeenDeadlineWarningKeys] = useState([]);
+  const [pipelineStartConflict, setPipelineStartConflict] = useState(null);
+  const [pipelineCompletionConflict, setPipelineCompletionConflict] = useState(null);
+  const [inProgressBlockDialog, setInProgressBlockDialog] = useState(null);
+  const [changingStatusTicketId, setChangingStatusTicketId] = useState("");
   const staleRebalanceSignatureRef = useRef("");
   const urgentRebalanceSignatureRef = useRef("");
   const queryClient = useQueryClient();
@@ -1971,6 +2367,13 @@ export default function DevPipeline() {
     queryFn: () => appClient.entities.Client.list(),
   });
 
+  const { data: configList = [] } = useQuery({
+    queryKey: ["priority_config"],
+    queryFn: () => appClient.entities.PriorityConfig.list(),
+  });
+
+  const config = configList[0] || DEFAULT_CONFIG;
+
   const clientsById = useMemo(
     () => new Map(clients.map((client) => [client.id, client])),
     [clients]
@@ -1986,21 +2389,21 @@ export default function DevPipeline() {
     [clients]
   );
 
-  const getTicketClientKey = (ticket) => {
+  const getTicketClient = (ticket) => {
     const byId = ticket?.client_id ? clientsById.get(ticket.client_id) : null;
     const byName = !byId && ticket?.client_name
       ? clientsByName.get(String(ticket.client_name).toLowerCase())
       : null;
-    const client = byId || byName || null;
+    return byId || byName || null;
+  };
+
+  const getTicketClientKey = (ticket) => {
+    const client = getTicketClient(ticket);
     return client?.id || NO_CLIENT_FILTER_ID;
   };
 
   const getTicketClientMeta = (ticket) => {
-    const byId = ticket?.client_id ? clientsById.get(ticket.client_id) : null;
-    const byName = !byId && ticket?.client_name
-      ? clientsByName.get(String(ticket.client_name).toLowerCase())
-      : null;
-    const client = byId || byName || null;
+    const client = getTicketClient(ticket);
 
     return {
       clientId: client?.id || NO_CLIENT_FILTER_ID,
@@ -2047,6 +2450,15 @@ export default function DevPipeline() {
     if (!email) return null;
     return activeDevs.find((dev) => normalizeText(dev?.email) === email) || null;
   }, [activeDevs, user?.email]);
+  const deadlineWarningStorageKey = useMemo(
+    () => getDeadlineWarningStorageKey(user?.id || user?.email || loggedDeveloper?.id),
+    [loggedDeveloper?.id, user?.email, user?.id]
+  );
+
+  useEffect(() => {
+    setSeenDeadlineWarningKeys(readStoredStringList(deadlineWarningStorageKey));
+  }, [deadlineWarningStorageKey]);
+
   const selectableDevelopers = useMemo(
     () => (canViewAllPipelines ? activeDevs : loggedDeveloper ? [loggedDeveloper] : []),
     [activeDevs, canViewAllPipelines, loggedDeveloper]
@@ -2308,9 +2720,27 @@ export default function DevPipeline() {
       .filter((entry) => entry.info && !dismissedIds.has(entry.ticket.id))
       .sort((a, b) => String(a.info.plannedEndLabel).localeCompare(String(b.info.plannedEndLabel)));
   }, [currentTime, dismissedInProgressReminderIds, tickets, visibleDeveloperIds]);
+  const inProgressDeadlineWarnings = useMemo(() => {
+    if (!loggedDeveloper?.id) return [];
+    const seenKeys = new Set(seenDeadlineWarningKeys);
+    const todayStr = moment().format("YYYY-MM-DD");
+
+    return tickets
+      .filter((ticket) => ticket.assignee_id === loggedDeveloper.id)
+      .map((ticket) => {
+        const info = getInProgressDeadlineWarningInfo(ticket, currentTime, todayStr);
+        const key = getDeadlineWarningKey(ticket, info);
+        return { ticket, info, key };
+      })
+      .filter((entry) => entry.info && entry.key && !seenKeys.has(entry.key))
+      .sort((a, b) => a.info.minutesRemaining - b.info.minutesRemaining);
+  }, [currentTime, loggedDeveloper?.id, seenDeadlineWarningKeys, tickets]);
   const canDownloadTimesheet =
     Boolean(activeDeveloper) &&
     (isAdmin || (loggedDeveloper && activeDeveloper?.id === loggedDeveloper.id));
+  const canChangePipelineStatuses = Boolean(
+    loggedDeveloper?.id && activeDeveloper?.id === loggedDeveloper.id
+  );
 
   const filteredTickets = useMemo(() => {
     if (selectedClientIdSet.size === 0) return [];
@@ -2320,6 +2750,64 @@ export default function DevPipeline() {
       return selectedClientIdSet.has(getTicketClientKey(ticket));
     });
   }, [tickets, selectedClientIdSet, clientsById, clientsByName]);
+
+  const pausedTickets = useMemo(() => {
+    if (visibleDeveloperIds.size === 0) return [];
+    return filteredTickets
+      .filter((ticket) =>
+        visibleDeveloperIds.has(ticket.assignee_id) &&
+        normalizeTicketStatus(ticket.status) === "blocked"
+      )
+      .sort((a, b) => {
+        const pausedA = Date.parse(a?.paused_at || "") || 0;
+        const pausedB = Date.parse(b?.paused_at || "") || 0;
+        if (pausedA !== pausedB) return pausedB - pausedA;
+        return getEffectivePriorityScore(b) - getEffectivePriorityScore(a);
+      });
+  }, [filteredTickets, visibleDeveloperIds]);
+
+  useEffect(() => {
+    if (pausedTickets.length === 0) {
+      setShowPausedTicketList(false);
+    }
+  }, [pausedTickets.length]);
+
+  const markDeadlineWarningSeen = (warningKey) => {
+    if (!warningKey) return;
+    setSeenDeadlineWarningKeys((current) => {
+      if (current.includes(warningKey)) return current;
+      const next = [...current, warningKey].slice(-250);
+      writeStoredStringList(deadlineWarningStorageKey, next);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (deadlineWarningDialog || inProgressDeadlineWarnings.length === 0) return;
+
+    const nextWarning = inProgressDeadlineWarnings[0];
+    setDeadlineExtensionInput("0.5");
+    setDeadlineWarningDialog(nextWarning);
+
+    if (
+      getBrowserNotificationPermission() === "granted" &&
+      areBrowserNotificationsEnabled(user?.id || user?.email)
+    ) {
+      showBrowserNotification({
+        title: "Ticket in scadenza",
+        body: `${nextWarning.ticket.title} finisce alle ${nextWarning.info.endTime}.`,
+        url: buildTicketDetailUrl(nextWarning.ticket.id, loggedDeveloper?.id || activeDeveloperId),
+        tag: `ticket-deadline-${nextWarning.key}`,
+      }).catch(() => {});
+    }
+  }, [
+    activeDeveloperId,
+    deadlineWarningDialog,
+    inProgressDeadlineWarnings,
+    loggedDeveloper?.id,
+    user?.email,
+    user?.id,
+  ]);
 
   const dismissInProgressReminder = (ticketId) => {
     if (!ticketId) return;
@@ -2344,6 +2832,214 @@ export default function DevPipeline() {
       await Promise.all(
         updates.map((entry) => appClient.entities.Ticket.update(entry.id, entry.updates))
       );
+    }
+  };
+
+  const openResumePausedTicketDialog = (ticket) => {
+    if (!ticket?.id) return;
+    const workedEffort = roundHalf(getWorkedEffortHours(ticket));
+    const remainingEffort = roundHalf(getRemainingEffortHours(ticket));
+    setResumePausedRemainingInput(String(remainingEffort > 0 ? remainingEffort : 0.5));
+    setResumePausedTicketDialog({ ticket, workedEffort, remainingEffort });
+  };
+
+  const resumePausedTicket = async (ticket, remainingEffortHours) => {
+    if (!ticket?.id) return false;
+    if (!ticket.assignee_id) {
+      toast({
+        variant: "destructive",
+        title: "Assignee mancante",
+        description: "Assegna il ticket a un developer prima di riprenderlo.",
+      });
+      return false;
+    }
+
+    const nowInfo = getNowInRome();
+    const startTime = nowInfo.roundedTime || nowInfo.time;
+    const startDate = nowInfo.date || moment().format("YYYY-MM-DD");
+    const dev = developers.find((developer) => developer.id === ticket.assignee_id) || null;
+    const workedEffort = roundHalf(getWorkedEffortHours(ticket));
+    const normalizedRemainingEffort = normalizeEffortHours(remainingEffortHours);
+    const effortToPlan = Number(
+      normalizedRemainingEffort ||
+      getRemainingEffortHours(ticket) ||
+      getPlannedEffortHours(ticket) ||
+      0
+    );
+
+    if (effortToPlan <= 0) {
+      toast({
+        variant: "destructive",
+        title: "Effort mancante",
+        description: "Indica almeno 0.5h di effort rimanente per riprendere il ticket.",
+      });
+      return false;
+    }
+
+    const latestTickets = await appClient.entities.Ticket.list();
+    const activeInProgressTicket = findConcurrentInProgressTicket(ticket, latestTickets);
+    if (activeInProgressTicket) {
+      openInProgressBlockDialog(ticket, activeInProgressTicket);
+      return false;
+    }
+
+    const selectedStartDecimal = timeToDecimal(startTime);
+    const unavailableIntervals = getDeveloperUnavailableIntervalsByDate(dev)[startDate] || [];
+    const hasStartConflict = unavailableIntervals.some(
+      (interval) =>
+        Number.isFinite(selectedStartDecimal) &&
+        selectedStartDecimal >= interval.start &&
+        selectedStartDecimal < interval.end
+    );
+
+    if (hasStartConflict) {
+      toast({
+        variant: "destructive",
+        title: "Orario non disponibile",
+        description: "Il ticket non puo iniziare in una fascia bloccata impostata in disponibilita.",
+      });
+      return false;
+    }
+
+    const splitSchedule = buildInProgressSchedule(
+      startDate,
+      startTime,
+      effortToPlan,
+      dev
+    );
+    const activeScheduleSegments = splitSchedule
+      ? getAllTicketSegments(splitSchedule)
+      : [];
+
+    if (activeScheduleSegments.length === 0) {
+      toast({
+        variant: "destructive",
+        title: "Nessuno slot disponibile",
+        description: "Non ho trovato uno spazio utile per ripianificare il ticket.",
+      });
+      return false;
+    }
+
+    for (const segment of activeScheduleSegments) {
+      const conflict = checkScheduleConflict(
+        latestTickets,
+        ticket.assignee_id,
+        getEffectivePriorityScore(ticket),
+        segment.date,
+        decimalToTime(segment.start),
+        decimalToTime(segment.end),
+        ticket.id,
+        dev,
+        { allowTicketReflow: true }
+      );
+
+      if (conflict.status !== "ok") {
+        const suggestion = conflict.suggestedSchedule
+          ? ` Slot libero suggerito: ${conflict.suggestedSchedule.date} ${conflict.suggestedSchedule.start_time}-${conflict.suggestedSchedule.end_time}.`
+          : "";
+        toast({
+          variant: "destructive",
+          title: "Slot gia occupato",
+          description: `${conflict.message}${suggestion}`,
+        });
+        return false;
+      }
+    }
+
+    const ticketClient = getTicketClient(ticket);
+    const nextRemainingEffort = Number(normalizedRemainingEffort || effortToPlan);
+    const nextPlannedEffort = roundHalf(workedEffort + nextRemainingEffort);
+    const scheduleUpdates = schedulePayloadFromSegments([
+      ...getWorkedTicketSegments(ticket),
+      ...activeScheduleSegments,
+    ]);
+    const clearMissingDataOnReactivation = ticket?.missing_required_data === true;
+    const reactivationData = clearMissingDataOnReactivation
+      ? {
+          missing_required_data: false,
+          missing_required_data_reported_at: null,
+          missing_required_data_reported_by: null,
+          missing_required_data_reported_by_id: null,
+          priority_override: null,
+        }
+      : {};
+    const nextTicketForPriority = {
+      ...ticket,
+      status: "in_progress",
+      missing_required_data: false,
+      priority_override: null,
+      proposed_effort: nextPlannedEffort,
+    };
+    const auditEntry = {
+      timestamp: new Date().toISOString(),
+      user: user?.email || user?.full_name || "user",
+      action: "ticket_resumed",
+      details: `Ticket resumed with ${nextRemainingEffort}h remaining after ${workedEffort}h worked`,
+    };
+
+    await appClient.entities.Ticket.update(ticket.id, {
+      status: "in_progress",
+      ...scheduleUpdates,
+      ...reactivationData,
+      proposed_effort: nextPlannedEffort,
+      remaining_effort_hours: nextRemainingEffort,
+      resumed_at: new Date().toISOString(),
+      resumed_by: user?.email || user?.full_name || "user",
+      resumed_by_id: user?.id || null,
+      priority_score: calculatePriorityScore(nextTicketForPriority, ticketClient, config),
+      audit_log: [...(ticket.audit_log || []), auditEntry],
+    });
+
+    const anchorStart = timeToDecimal(scheduleUpdates.start_time);
+    await applyDeveloperRebalance(ticket.assignee_id, dev, {
+      freezeTicketIds: [ticket.id],
+      preserveWorkingDaysFromToday: 0,
+      preserveExistingSequence: true,
+      includeTodayHoles: true,
+      freezeCurrentWeekSegments: false,
+      preserveTodaySegments: false,
+      allowInProgressReplan: true,
+      planningStartDate: scheduleUpdates.scheduled_date || startDate,
+      ...(Number.isFinite(anchorStart) && scheduleUpdates.scheduled_date
+        ? {
+            manualInsertionAnchor: {
+              date: scheduleUpdates.scheduled_date,
+              start: anchorStart,
+            },
+          }
+        : {}),
+    });
+
+    await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+    toast({
+      title: "Ticket ripreso",
+      description: `${ticket.title} e tornato in progress con ${nextRemainingEffort}h rimanenti.`,
+    });
+    return true;
+  };
+
+  const handleResumePausedTicketConfirm = async () => {
+    const selectedTicket = resumePausedTicketDialog?.ticket;
+    if (!selectedTicket?.id) return;
+
+    const nextRemaining = normalizeEffortHours(resumePausedRemainingInput);
+    if (!nextRemaining) return;
+
+    const latestTicket = tickets.find((ticket) => ticket.id === selectedTicket.id) || selectedTicket;
+    setResumingPausedTicketId(latestTicket.id);
+    try {
+      const resumed = await resumePausedTicket(latestTicket, nextRemaining);
+      if (resumed) {
+        setResumePausedTicketDialog(null);
+      }
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Ripresa non riuscita",
+        description: error?.message || "Riprova tra qualche secondo.",
+      });
+    } finally {
+      setResumingPausedTicketId("");
     }
   };
 
@@ -2454,6 +3150,627 @@ export default function DevPipeline() {
       title: "Task estesa",
       description: `${ticket.title} estesa fino alle ${decimalToTime(nextEnd)}.`,
     });
+  };
+
+  const handleConfirmDeadlineWarning = () => {
+    markDeadlineWarningSeen(deadlineWarningDialog?.key);
+    setDeadlineWarningDialog(null);
+  };
+
+  const handleIncreaseDeadlineWarningEffort = async () => {
+    const warning = deadlineWarningDialog;
+    const selectedTicket = warning?.ticket;
+    if (!selectedTicket?.id) return;
+
+    const extraHours = normalizeEffortHours(deadlineExtensionInput);
+    if (!extraHours) return;
+
+    const ticket = tickets.find((entry) => entry.id === selectedTicket.id) || selectedTicket;
+    const normalizedStatus = normalizeTicketStatus(ticket.status);
+    if (normalizedStatus !== "in_progress") {
+      setDeadlineWarningDialog(null);
+      toast({
+        title: "Ticket non piu in progress",
+        description: "La scadenza e cambiata o il ticket e gia stato aggiornato.",
+      });
+      return;
+    }
+
+    const dev = developers.find((developer) => developer.id === ticket.assignee_id) || null;
+    const currentSegments = sortSegments(getAllTicketSegments(ticket));
+    const lastSegment = currentSegments[currentSegments.length - 1] || null;
+    if (!lastSegment) {
+      toast({
+        variant: "destructive",
+        title: "Schedule mancante",
+        description: "Apri il ticket e verifica la pianificazione prima di aumentare l'effort.",
+      });
+      return;
+    }
+
+    setUpdatingDeadlineWarning(true);
+    try {
+      const extensionSchedule = buildInProgressSchedule(
+        lastSegment.date,
+        decimalToTime(lastSegment.end),
+        extraHours,
+        dev
+      );
+      const extensionSegments = extensionSchedule
+        ? getAllTicketSegments(extensionSchedule)
+        : [];
+
+      if (extensionSegments.length === 0) {
+        toast({
+          variant: "destructive",
+          title: "Nessuno slot disponibile",
+          description: "Non ho trovato spazio utile per aggiungere ore a questo ticket.",
+        });
+        return;
+      }
+
+      const scheduleUpdates = schedulePayloadFromSegments([
+        ...currentSegments,
+        ...extensionSegments,
+      ]);
+      const nextSegments = sortSegments(getAllTicketSegments({ ...ticket, ...scheduleUpdates }));
+      const nextLastSegment = nextSegments[nextSegments.length - 1] || null;
+      const currentEffort = Math.max(getPlannedEffortHours(ticket), getTicketEffort(ticket));
+      const nextPlannedEffort = roundHalf(currentEffort + extraHours);
+      const hasExplicitRemaining =
+        ticket.remaining_effort_hours !== null &&
+        ticket.remaining_effort_hours !== undefined;
+      const ticketClient = getTicketClient(ticket);
+      const nextTicketForPriority = {
+        ...ticket,
+        ...scheduleUpdates,
+        proposed_effort: nextPlannedEffort,
+      };
+      const auditEntry = {
+        timestamp: new Date().toISOString(),
+        user: user?.email || user?.full_name || "user",
+        action: "effort_extended",
+        details: `Effort increased by ${extraHours}h from deadline warning; planned effort ${nextPlannedEffort}h`,
+      };
+
+      await appClient.entities.Ticket.update(ticket.id, {
+        ...scheduleUpdates,
+        proposed_effort: nextPlannedEffort,
+        ...(hasExplicitRemaining
+          ? { remaining_effort_hours: roundHalf(getRemainingEffortHours(ticket) + extraHours) }
+          : {}),
+        priority_score: calculatePriorityScore(nextTicketForPriority, ticketClient, config),
+        audit_log: [...(ticket.audit_log || []), auditEntry],
+      });
+
+      await rebalanceAfterReminderAction(ticket, {
+        freezeTicketIds: [ticket.id],
+        preserveWorkingDaysFromToday: 0,
+        preserveExistingSequence: true,
+        includeTodayHoles: true,
+        freezeCurrentWeekSegments: false,
+        preserveTodaySegments: false,
+        allowInProgressReplan: true,
+        planningStartDate: nextLastSegment?.date || lastSegment.date,
+        ...(nextLastSegment
+          ? {
+              manualInsertionAnchor: {
+                date: nextLastSegment.date,
+                start: nextLastSegment.end,
+              },
+            }
+          : {}),
+      });
+
+      await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+      markDeadlineWarningSeen(warning.key);
+      setDeadlineWarningDialog(null);
+      toast({
+        title: "Effort aumentato",
+        description: `${ticket.title} esteso di ${extraHours}h.`,
+      });
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Aggiornamento non riuscito",
+        description: error?.message || "Riprova tra qualche secondo.",
+      });
+    } finally {
+      setUpdatingDeadlineWarning(false);
+    }
+  };
+
+  const canChangePipelineStatusForTicket = (ticket) => {
+    if (!canChangePipelineStatuses || !ticket?.id) return false;
+    if (ticket.assignee_id !== loggedDeveloper?.id) return false;
+    return !isTicketClosed(ticket);
+  };
+
+  const findConcurrentInProgressTicket = (ticket, sourceTickets = tickets) => {
+    if (!ticket?.assignee_id) return null;
+    return (sourceTickets || []).find(
+      (entry) =>
+        entry?.id &&
+        entry.id !== ticket.id &&
+        entry.assignee_id === ticket.assignee_id &&
+        normalizeTicketStatus(entry.status) === "in_progress"
+    ) || null;
+  };
+
+  const openInProgressBlockDialog = (ticket, activeTicket) => {
+    if (!ticket?.id || !activeTicket?.id) return;
+    setInProgressBlockDialog({ ticket, activeTicket });
+  };
+
+  const getPipelineCompletionConflictData = (ticket, newStatus) => {
+    if (!ticket?.id || !isClosedStatus(newStatus) || isTicketClosed(ticket)) return null;
+
+    const nowInfo = getNowInRome();
+    const planned = getPlannedCompletionInfo(ticket);
+    const nowRoundedTime = nowInfo.roundedTime || nowInfo.time;
+    const samePlanned =
+      planned &&
+      planned.date === nowInfo.date &&
+      planned.time === nowRoundedTime;
+
+    if (!planned || samePlanned) return null;
+
+    return {
+      ticket,
+      status: newStatus,
+      nowDate: nowInfo.date,
+      nowTime: nowRoundedTime,
+      plannedDate: planned.date,
+      plannedTime: planned.time,
+    };
+  };
+
+  const applyPipelineStatusChange = async (ticket, newStatus, options = {}) => {
+    if (!ticket?.id) return false;
+
+    const normalizedNewStatus = normalizeTicketStatus(newStatus);
+    const previousStatus = normalizeTicketStatus(ticket.status);
+    if (previousStatus === normalizedNewStatus) return false;
+
+    const {
+      overrideStartDate = null,
+      overrideStartTime = null,
+      completionMode = "now",
+      completionDate = null,
+      completionTime = null,
+      remainingEffortHours = null,
+      auditAction = "status_change",
+      auditDetails = "",
+    } = options;
+
+    const nowInfo = getNowInRome();
+    const nowTime = nowInfo.roundedTime || nowInfo.time;
+    const dev = developers.find((developer) => developer.id === ticket.assignee_id) || null;
+    const ticketClient = getTicketClient(ticket);
+    const timeData = {};
+    const lifecycleData = {};
+    const statusMetadata = {};
+    const isCompletionStatus = isClosedStatus(normalizedNewStatus);
+    const wasCompletionStatus = isTicketClosed(ticket);
+    const isReactivatingFromBlocked =
+      previousStatus === "blocked" &&
+      normalizedNewStatus !== "blocked" &&
+      !isCompletionStatus;
+    let resolvedCompletionDateForRebalance = null;
+    let resolvedCompletionTimeForRebalance = null;
+
+    if (normalizedNewStatus === "in_progress") {
+      if (!ticket.assignee_id) {
+        toast({
+          variant: "destructive",
+          title: "Assignee mancante",
+          description: "Assegna il ticket a un developer prima di avviarlo.",
+        });
+        return false;
+      }
+
+      const latestTickets = await appClient.entities.Ticket.list();
+      const activeInProgressTicket = findConcurrentInProgressTicket(ticket, latestTickets);
+      if (activeInProgressTicket) {
+        openInProgressBlockDialog(ticket, activeInProgressTicket);
+        return false;
+      }
+
+      const selectedStartTime = overrideStartTime || ticket.start_time || nowTime;
+      const selectedStartDate =
+        overrideStartDate ||
+        (selectedStartTime === nowTime
+          ? nowInfo.date
+          : ticket.scheduled_date || nowInfo.date);
+      const workedEffort = roundHalf(getWorkedEffortHours(ticket));
+      const normalizedRemainingEffort = normalizeEffortHours(remainingEffortHours);
+      const isResumingWorkedTicket =
+        workedEffort > 0 && ["blocked", "new"].includes(previousStatus);
+      const effortToPlan = isResumingWorkedTicket
+        ? Number(normalizedRemainingEffort || getRemainingEffortHours(ticket) || 0)
+        : Number(getPlannedEffortHours(ticket) || getTicketEffort(ticket) || 0);
+
+      if (effortToPlan <= 0) {
+        toast({
+          variant: "destructive",
+          title: "Effort mancante",
+          description: "Indica almeno 0.5h di effort prima di avviare il ticket.",
+        });
+        return false;
+      }
+
+      const selectedStartDecimal = timeToDecimal(selectedStartTime);
+      const unavailableIntervals = getDeveloperUnavailableIntervalsByDate(dev)[selectedStartDate] || [];
+      const hasStartConflict = unavailableIntervals.some(
+        (interval) =>
+          Number.isFinite(selectedStartDecimal) &&
+          selectedStartDecimal >= interval.start &&
+          selectedStartDecimal < interval.end
+      );
+
+      if (hasStartConflict) {
+        toast({
+          variant: "destructive",
+          title: "Orario non disponibile",
+          description: "Il ticket non puo iniziare in una fascia bloccata impostata in disponibilita.",
+        });
+        return false;
+      }
+
+      const splitSchedule = buildInProgressSchedule(
+        selectedStartDate,
+        selectedStartTime,
+        effortToPlan,
+        dev
+      );
+      const activeScheduleSegments = splitSchedule
+        ? getAllTicketSegments(splitSchedule)
+        : [];
+
+      if (activeScheduleSegments.length === 0) {
+        toast({
+          variant: "destructive",
+          title: "Nessuno slot disponibile",
+          description: "Non ho trovato uno spazio utile per pianificare il ticket.",
+        });
+        return false;
+      }
+
+      for (const segment of activeScheduleSegments) {
+        const conflict = checkScheduleConflict(
+          latestTickets,
+          ticket.assignee_id,
+          getEffectivePriorityScore(ticket),
+          segment.date,
+          decimalToTime(segment.start),
+          decimalToTime(segment.end),
+          ticket.id,
+          dev,
+          { allowTicketReflow: true }
+        );
+
+        if (conflict.status !== "ok") {
+          const suggestion = conflict.suggestedSchedule
+            ? ` Slot libero suggerito: ${conflict.suggestedSchedule.date} ${conflict.suggestedSchedule.start_time}-${conflict.suggestedSchedule.end_time}.`
+            : "";
+          toast({
+            variant: "destructive",
+            title: "Slot gia occupato",
+            description: `${conflict.message}${suggestion}`,
+          });
+          return false;
+        }
+      }
+
+      Object.assign(
+        timeData,
+        schedulePayloadFromSegments(
+          isResumingWorkedTicket
+            ? [...getWorkedTicketSegments(ticket), ...activeScheduleSegments]
+            : activeScheduleSegments
+        )
+      );
+
+      if (isResumingWorkedTicket) {
+        const nextRemainingEffort = Number(normalizedRemainingEffort || effortToPlan);
+        const nextPlannedEffort = roundHalf(workedEffort + nextRemainingEffort);
+        Object.assign(lifecycleData, {
+          proposed_effort: nextPlannedEffort,
+          remaining_effort_hours: nextRemainingEffort,
+          resumed_at: new Date().toISOString(),
+          resumed_by: user?.email || user?.full_name || "user",
+          resumed_by_id: user?.id || null,
+          priority_score: calculatePriorityScore(
+            {
+              ...ticket,
+              status: normalizedNewStatus,
+              missing_required_data: false,
+              priority_override: null,
+              proposed_effort: nextPlannedEffort,
+            },
+            ticketClient,
+            config
+          ),
+        });
+      }
+    }
+
+    if (normalizedNewStatus === "blocked") {
+      const pauseSnapshot = previousStatus === "in_progress"
+        ? buildPauseScheduleSnapshot(ticket, nowInfo.date, nowInfo.roundedTime || nowInfo.time)
+        : null;
+
+      if (pauseSnapshot) {
+        Object.assign(timeData, pauseSnapshot.schedule);
+        Object.assign(lifecycleData, {
+          worked_effort_hours: pauseSnapshot.workedEffort,
+          remaining_effort_hours: pauseSnapshot.remainingEffort,
+          paused_at: new Date().toISOString(),
+          paused_by: user?.email || user?.full_name || "user",
+          paused_by_id: user?.id || null,
+          paused_from_status: previousStatus,
+        });
+      } else {
+        Object.assign(timeData, {
+          scheduled_date: null,
+          start_time: null,
+          end_time: null,
+          continuation_schedule: [],
+        });
+      }
+    }
+
+    if (isReactivatingFromBlocked && normalizedNewStatus !== "in_progress") {
+      if (getWorkedEffortHours(ticket) <= 0) {
+        Object.assign(timeData, {
+          scheduled_date: null,
+          start_time: null,
+          end_time: null,
+          continuation_schedule: [],
+        });
+      }
+    }
+
+    if (isReactivatingFromBlocked && ticket?.missing_required_data === true) {
+      Object.assign(statusMetadata, {
+        missing_required_data: false,
+        missing_required_data_reported_at: null,
+        missing_required_data_reported_by: null,
+        missing_required_data_reported_by_id: null,
+        priority_override: null,
+        priority_score: calculatePriorityScore(
+          {
+            ...ticket,
+            status: normalizedNewStatus,
+            missing_required_data: false,
+            priority_override: null,
+          },
+          ticketClient,
+          config
+        ),
+      });
+    }
+
+    if (isCompletionStatus && !wasCompletionStatus) {
+      const resolvedCompletionDate =
+        completionMode === "planned" && completionDate
+          ? completionDate
+          : nowInfo.date;
+      const resolvedCompletionTime =
+        completionMode === "planned" && completionTime
+          ? completionTime
+          : (nowInfo.roundedTime || nowInfo.time);
+      resolvedCompletionDateForRebalance = resolvedCompletionDate;
+      resolvedCompletionTimeForRebalance = resolvedCompletionTime;
+
+      const doneSnapshot = buildDoneScheduleSnapshot(
+        ticket,
+        resolvedCompletionDate,
+        resolvedCompletionTime
+      );
+
+      if (doneSnapshot) {
+        Object.assign(timeData, doneSnapshot);
+      } else {
+        const startDec = timeToDecimal(ticket.start_time);
+        const endDec = timeToDecimal(resolvedCompletionTime);
+        const diffH = Number.isFinite(startDec) && Number.isFinite(endDec)
+          ? roundHalf(Math.max(0, endDec - startDec))
+          : 0;
+        Object.assign(timeData, {
+          end_time: resolvedCompletionTime,
+          continuation_schedule: [],
+          ...(diffH > 0 ? { effort_hours: diffH } : {}),
+        });
+      }
+
+      if (normalizedNewStatus === "qa_review") {
+        Object.assign(statusMetadata, {
+          qa_requested_at: new Date().toISOString(),
+          qa_requested_by: user?.email || user?.full_name || "user",
+          qa_requested_by_id: user?.id || null,
+        });
+      }
+    }
+
+    const auditStartTime = timeData.start_time || null;
+    const auditEndTime = isCompletionStatus
+      ? (timeData.end_time || completionTime || nowInfo.roundedTime || nowInfo.time)
+      : (timeData.end_time || null);
+    const auditEntry = {
+      timestamp: new Date().toISOString(),
+      user: user?.email || user?.full_name || "user",
+      action: auditAction,
+      details:
+        auditDetails ||
+        `Status: ${previousStatus} -> ${normalizedNewStatus}${auditStartTime ? ` (start: ${auditStartTime})` : ""}${auditEndTime ? ` (end: ${auditEndTime})` : ""}`,
+    };
+
+    await appClient.entities.Ticket.update(ticket.id, {
+      status: normalizedNewStatus,
+      ...timeData,
+      ...statusMetadata,
+      ...lifecycleData,
+      audit_log: [...(ticket.audit_log || []), auditEntry],
+    });
+
+    if (ticket.assignee_id) {
+      if (normalizedNewStatus === "in_progress") {
+        const anchorStart = timeToDecimal(timeData.start_time);
+        await applyDeveloperRebalance(ticket.assignee_id, dev, {
+          freezeTicketIds: [ticket.id],
+          preserveWorkingDaysFromToday: 0,
+          preserveExistingSequence: true,
+          includeTodayHoles: true,
+          freezeCurrentWeekSegments: false,
+          preserveTodaySegments: false,
+          allowInProgressReplan: true,
+          planningStartDate: timeData.scheduled_date || nowInfo.date,
+          ...(Number.isFinite(anchorStart) && timeData.scheduled_date
+            ? {
+                manualInsertionAnchor: {
+                  date: timeData.scheduled_date,
+                  start: anchorStart,
+                },
+              }
+            : {}),
+        });
+      } else if (isReactivatingFromBlocked) {
+        await applyDeveloperRebalance(ticket.assignee_id, dev, {
+          preserveWorkingDaysFromToday: 0,
+          preserveExistingSequence: false,
+          includeTodayHoles: true,
+          freezeCurrentWeekSegments: false,
+          preserveTodaySegments: false,
+          preserveElapsedTodaySegments: true,
+          allowInProgressReplan: true,
+          forceFirstTicketIds: [ticket.id],
+          planningStartDate: nowInfo.date,
+          manualInsertionAnchor: {
+            date: nowInfo.date,
+            start: nowInfo.roundedDecimal ?? DAY_START,
+          },
+        });
+      } else if (isCompletionStatus && !wasCompletionStatus) {
+        if (completionMode === "planned") {
+          await applyDeveloperRebalance(ticket.assignee_id, dev, {
+            preserveWorkingDaysFromToday: 3,
+          });
+        } else {
+          const completionAnchor = timeToDecimal(resolvedCompletionTimeForRebalance);
+          await applyDeveloperRebalance(ticket.assignee_id, dev, {
+            preserveWorkingDaysFromToday: 0,
+            preserveExistingSequence: true,
+            includeTodayHoles: true,
+            freezeCurrentWeekSegments: false,
+            preserveTodaySegments: false,
+            planningStartDate: resolvedCompletionDateForRebalance || nowInfo.date,
+            ...(Number.isFinite(completionAnchor) && resolvedCompletionDateForRebalance
+              ? {
+                  manualInsertionAnchor: {
+                    date: resolvedCompletionDateForRebalance,
+                    start: completionAnchor,
+                  },
+                }
+              : {}),
+          });
+        }
+      } else {
+        await applyDeveloperRebalance(ticket.assignee_id, dev);
+      }
+    } else {
+      await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+    }
+
+    if (isCompletionStatus && !wasCompletionStatus && ticket.created_by) {
+      appClient.integrations.Core.SendEmail({
+        to: ticket.created_by,
+        subject: `Ticket completato/review: ${ticket.title}`,
+        body: `Il ticket "${ticket.title}" per ${ticket.client_name || "N/A"} e stato concluso con stato ${normalizedNewStatus}.`,
+      }).catch(() => {});
+    }
+
+    return true;
+  };
+
+  const executePipelineStatusChange = async (ticket, newStatus, options = {}) => {
+    if (!ticket?.id) return;
+    const latestTicket = tickets.find((entry) => entry.id === ticket.id) || ticket;
+    if (!canChangePipelineStatusForTicket(latestTicket)) return;
+
+    setChangingStatusTicketId(latestTicket.id);
+    try {
+      const updated = await applyPipelineStatusChange(latestTicket, newStatus, options);
+      if (updated) {
+        const normalizedNewStatus = normalizeTicketStatus(newStatus);
+        toast({
+          title: "Stato aggiornato",
+          description: `${latestTicket.title} -> ${STATUS_CONFIG[normalizedNewStatus]?.label || normalizedNewStatus}.`,
+        });
+      }
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Cambio stato non riuscito",
+        description: error?.message || "Riprova tra qualche secondo.",
+      });
+    } finally {
+      setChangingStatusTicketId("");
+    }
+  };
+
+  const requestPipelineStatusChange = async (ticket, newStatus) => {
+    if (!ticket?.id) return;
+    const latestTicket = tickets.find((entry) => entry.id === ticket.id) || ticket;
+    if (!canChangePipelineStatusForTicket(latestTicket)) return;
+
+    const normalizedNewStatus = normalizeTicketStatus(newStatus);
+    const previousStatus = normalizeTicketStatus(latestTicket.status);
+    if (previousStatus === normalizedNewStatus) return;
+
+    if (normalizedNewStatus === "in_progress") {
+      const activeInProgressTicket = findConcurrentInProgressTicket(latestTicket);
+      if (activeInProgressTicket) {
+        openInProgressBlockDialog(latestTicket, activeInProgressTicket);
+        return;
+      }
+    }
+
+    if (
+      normalizedNewStatus === "in_progress" &&
+      ["blocked", "new"].includes(previousStatus) &&
+      getWorkedEffortHours(latestTicket) > 0
+    ) {
+      openResumePausedTicketDialog(latestTicket);
+      return;
+    }
+
+    if (normalizedNewStatus === "in_progress" && latestTicket.start_time) {
+      const nowInfo = getNowInRome();
+      const nowStartTime = nowInfo.roundedTime || nowInfo.time;
+      const plannedDate = latestTicket.scheduled_date || nowInfo.date;
+      const plannedTime = latestTicket.start_time;
+      if (plannedDate !== nowInfo.date || plannedTime !== nowStartTime) {
+        setPipelineStartConflict({
+          ticket: latestTicket,
+          nowDate: nowInfo.date,
+          nowTime: nowStartTime,
+          plannedDate,
+          plannedTime,
+        });
+        return;
+      }
+    }
+
+    if (isClosedStatus(normalizedNewStatus) && !isTicketClosed(latestTicket)) {
+      const conflict = getPipelineCompletionConflictData(latestTicket, normalizedNewStatus);
+      if (conflict) {
+        setPipelineCompletionConflict(conflict);
+        return;
+      }
+    }
+
+    await executePipelineStatusChange(latestTicket, normalizedNewStatus);
   };
 
   const toggleClientFilter = (clientId) => {
@@ -2586,6 +3903,345 @@ export default function DevPipeline() {
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden" data-tour="pipeline-page">
+      {resumePausedTicketDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-border/70 bg-card p-6 shadow-xl">
+            <div className="flex items-start gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-violet-100 dark:bg-violet-500/15">
+                <Clock className="h-5 w-5 text-violet-600 dark:text-violet-300" />
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-foreground">Riprendi ticket in pausa</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  Le {resumePausedTicketDialog.workedEffort}h gia lavorate restano bloccate nel calendario. Verra pianificato solo l&apos;effort residuo.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 rounded-xl border border-border/70 bg-muted/25 p-4">
+              <div className="flex items-center justify-between gap-3 text-xs">
+                <span className="text-muted-foreground">Effort gia lavorato</span>
+                <span className="font-semibold text-foreground">{resumePausedTicketDialog.workedEffort}h</span>
+              </div>
+              <div className="mt-3 space-y-1.5">
+                <label className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                  Effort rimanente (h)
+                </label>
+                <Input
+                  type="number"
+                  min="0.5"
+                  step="0.5"
+                  value={resumePausedRemainingInput}
+                  onChange={(event) => setResumePausedRemainingInput(event.target.value)}
+                  className="h-10"
+                  autoFocus
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  Stima precedente: {resumePausedTicketDialog.remainingEffort}h. Puoi correggerla prima di ripartire.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setResumePausedTicketDialog(null)}
+                disabled={Boolean(resumingPausedTicketId)}
+              >
+                Annulla
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                disabled={!normalizeEffortHours(resumePausedRemainingInput) || Boolean(resumingPausedTicketId)}
+                onClick={handleResumePausedTicketConfirm}
+              >
+                {resumingPausedTicketId ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : null}
+                Riprendi e ripianifica
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deadlineWarningDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-border/70 bg-card p-6 shadow-xl">
+            <div className="flex items-start gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-amber-100 dark:bg-amber-500/15">
+                <Clock className="h-5 w-5 text-amber-600 dark:text-amber-300" />
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-foreground">Ticket in scadenza</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  Mancano {deadlineWarningDialog.info.minutesRemaining} minuti alla fine prevista di questo ticket.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 rounded-xl border border-border/70 bg-muted/25 p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-semibold text-foreground">
+                    {deadlineWarningDialog.ticket.title}
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Fine prevista alle {deadlineWarningDialog.info.endTime}
+                  </p>
+                </div>
+                <span className="shrink-0 rounded-full border border-amber-200 bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800 dark:border-amber-500/35 dark:bg-amber-500/15 dark:text-amber-200">
+                  -{deadlineWarningDialog.info.minutesRemaining} min
+                </span>
+              </div>
+
+              <div className="mt-4 space-y-1.5">
+                <label className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                  Ore da aggiungere
+                </label>
+                <div className="flex gap-2">
+                  <Input
+                    type="number"
+                    min="0.5"
+                    step="0.5"
+                    value={deadlineExtensionInput}
+                    onChange={(event) => setDeadlineExtensionInput(event.target.value)}
+                    className="h-10"
+                  />
+                  <Button
+                    type="button"
+                    className="h-10 shrink-0"
+                    disabled={!normalizeEffortHours(deadlineExtensionInput) || updatingDeadlineWarning}
+                    onClick={handleIncreaseDeadlineWarningEffort}
+                  >
+                    {updatingDeadlineWarning ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : null}
+                    Aumenta effort
+                  </Button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  Le ore verranno aggiunte all&apos;effort previsto e alla pianificazione del ticket.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleConfirmDeadlineWarning}
+                disabled={updatingDeadlineWarning}
+              >
+                Conferma orario
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {inProgressBlockDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-border/70 bg-card p-6 shadow-xl">
+            <div className="flex items-start gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-violet-100 dark:bg-violet-500/15">
+                <AlertTriangle className="h-5 w-5 text-violet-600 dark:text-violet-300" />
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-foreground">Ticket gia in progress</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  Non puoi avere piu ticket in progress contemporaneamente. Chiudi, metti in pausa o sposta prima quello gia attivo.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 rounded-xl border border-violet-200 bg-violet-50/70 p-4 dark:border-violet-500/30 dark:bg-violet-500/10">
+              {(() => {
+                const activeTicket = inProgressBlockDialog.activeTicket;
+                const { clientColor, clientName } = getTicketClientMeta(activeTicket);
+                const segments = sortSegments(getAllTicketSegments(activeTicket));
+                const lastSegment = segments[segments.length - 1] || null;
+                const plannedEnd = lastSegment
+                  ? `${moment(lastSegment.date, "YYYY-MM-DD", true).isValid() ? moment(lastSegment.date).format("DD/MM") : lastSegment.date} ${decimalToTime(lastSegment.end)}`
+                  : "";
+
+                return (
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-full border border-violet-200 bg-violet-100 px-2 py-0.5 text-[10px] font-semibold text-violet-800 dark:border-violet-500/35 dark:bg-violet-500/15 dark:text-violet-200">
+                        In progress
+                      </span>
+                      <span className="inline-flex min-w-0 items-center gap-1 text-[11px] font-medium text-muted-foreground">
+                        <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: clientColor }} />
+                        <span className="truncate">{clientName}</span>
+                      </span>
+                    </div>
+                    <p className="mt-2 truncate text-sm font-semibold text-foreground">
+                      {activeTicket.title}
+                    </p>
+                    {plannedEnd && (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Fine prevista: {plannedEnd}
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+
+            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setInProgressBlockDialog(null)}
+              >
+                Chiudi
+              </Button>
+              <Button asChild type="button" size="sm" onClick={() => setInProgressBlockDialog(null)}>
+                <Link to={buildTicketDetailUrl(inProgressBlockDialog.activeTicket.id, activeDeveloperId)}>
+                  Apri ticket attivo
+                </Link>
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pipelineStartConflict && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-border/70 bg-card p-6 shadow-xl">
+            <div className="flex items-start gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-amber-100 dark:bg-amber-500/15">
+                <AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-300" />
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-foreground">Orario di inizio diverso</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  L&apos;orario pianificato e <strong>{formatDateTimeLabel(pipelineStartConflict.plannedDate, pipelineStartConflict.plannedTime)}</strong>, ma ora sono le{" "}
+                  <strong>{formatDateTimeLabel(pipelineStartConflict.nowDate, pipelineStartConflict.nowTime)}</strong>.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-100">
+              Puoi usare l&apos;orario attuale solo se lo slot e libero. Se e occupato, la piattaforma blocchera l&apos;avvio.
+            </div>
+
+            <div className="mt-5 flex flex-col gap-2">
+              <Button
+                type="button"
+                size="sm"
+                className="h-9"
+                disabled={changingStatusTicketId === pipelineStartConflict.ticket?.id}
+                onClick={async () => {
+                  const payload = pipelineStartConflict;
+                  setPipelineStartConflict(null);
+                  await executePipelineStatusChange(payload.ticket, "in_progress", {
+                    overrideStartDate: payload.nowDate,
+                    overrideStartTime: payload.nowTime,
+                  });
+                }}
+              >
+                Usa orario attuale ({pipelineStartConflict.nowTime})
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-9"
+                disabled={changingStatusTicketId === pipelineStartConflict.ticket?.id}
+                onClick={async () => {
+                  const payload = pipelineStartConflict;
+                  setPipelineStartConflict(null);
+                  await executePipelineStatusChange(payload.ticket, "in_progress", {
+                    overrideStartDate: payload.plannedDate,
+                    overrideStartTime: payload.plannedTime,
+                  });
+                }}
+              >
+                Mantieni pianificato ({formatDateTimeLabel(pipelineStartConflict.plannedDate, pipelineStartConflict.plannedTime)})
+              </Button>
+              <button
+                type="button"
+                className="mt-1 text-xs font-medium text-muted-foreground hover:text-foreground"
+                onClick={() => setPipelineStartConflict(null)}
+              >
+                Annulla
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pipelineCompletionConflict && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-border/70 bg-card p-6 shadow-xl">
+            <div className="flex items-start gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-amber-100 dark:bg-amber-500/15">
+                <AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-300" />
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-foreground">Conferma orario di chiusura</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  Il fine pianificato e <strong>{formatDateTimeLabel(pipelineCompletionConflict.plannedDate, pipelineCompletionConflict.plannedTime)}</strong>, ma ora sono le{" "}
+                  <strong>{formatDateTimeLabel(pipelineCompletionConflict.nowDate, pipelineCompletionConflict.nowTime)}</strong>.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-100">
+              Scegli se chiudere con orario attuale e riorganizzare la pipeline, oppure mantenere l&apos;orario pianificato.
+            </div>
+
+            <div className="mt-5 flex flex-col gap-2">
+              <Button
+                type="button"
+                size="sm"
+                className="h-9"
+                disabled={changingStatusTicketId === pipelineCompletionConflict.ticket?.id}
+                onClick={async () => {
+                  const payload = pipelineCompletionConflict;
+                  setPipelineCompletionConflict(null);
+                  await executePipelineStatusChange(payload.ticket, payload.status, {
+                    completionMode: "now",
+                    completionDate: payload.nowDate,
+                    completionTime: payload.nowTime,
+                  });
+                }}
+              >
+                Usa orario attuale ({pipelineCompletionConflict.nowTime})
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-9"
+                disabled={changingStatusTicketId === pipelineCompletionConflict.ticket?.id}
+                onClick={async () => {
+                  const payload = pipelineCompletionConflict;
+                  setPipelineCompletionConflict(null);
+                  await executePipelineStatusChange(payload.ticket, payload.status, {
+                    completionMode: "planned",
+                    completionDate: payload.plannedDate,
+                    completionTime: payload.plannedTime,
+                  });
+                }}
+              >
+                Mantieni pianificato ({pipelineCompletionConflict.plannedTime})
+              </Button>
+              <button
+                type="button"
+                className="mt-1 text-xs font-medium text-muted-foreground hover:text-foreground"
+                onClick={() => setPipelineCompletionConflict(null)}
+              >
+                Annulla
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <Card className="shrink-0 space-y-2 border-border/55 bg-card/90 p-3 sm:p-3.5" data-tour="pipeline-filters">
         <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div className="space-y-0.5">
@@ -2722,6 +4378,112 @@ export default function DevPipeline() {
           </div>
         </div>
       </Card>
+
+      {pausedTickets.length > 0 && (
+        <Card className="shrink-0 overflow-hidden border-amber-200 bg-amber-50/85 shadow-[var(--shadow-soft)] dark:border-amber-500/30 dark:bg-amber-500/10">
+          <div className="flex flex-col gap-2 p-2.5 md:flex-row md:items-center md:justify-between">
+            <div className="flex min-w-0 items-center gap-2.5">
+              <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-amber-200/80 text-amber-800 dark:bg-amber-500/20 dark:text-amber-200">
+                <PauseCircle className="h-4 w-4" />
+              </span>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-amber-800 dark:text-amber-300">
+                    Ticket in pausa
+                  </p>
+                  <span className="rounded-full border border-amber-200 bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800 dark:border-amber-500/35 dark:bg-amber-500/15 dark:text-amber-200">
+                    {pausedTickets.length}
+                  </span>
+                </div>
+                <p className="truncate text-sm font-medium text-amber-950 dark:text-amber-100">
+                  {pausedTickets.length === 1
+                    ? `C'e un ticket in pausa per ${activeDeveloper?.name || "questo developer"}.`
+                    : `Ci sono ${pausedTickets.length} ticket in pausa per ${activeDeveloper?.name || "questo developer"}.`}
+                </p>
+              </div>
+            </div>
+
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 rounded-full px-3 text-xs"
+              onClick={() => setShowPausedTicketList((current) => !current)}
+            >
+              {showPausedTicketList ? "Nascondi" : "Mostra"}
+              <ChevronDown className={cn("ml-1.5 h-3.5 w-3.5 transition-transform", showPausedTicketList ? "rotate-180" : "")} />
+            </Button>
+          </div>
+
+          {showPausedTicketList && (
+            <div className="border-t border-amber-200/70 px-2.5 pb-2.5 pt-2 dark:border-amber-500/25">
+              <div className="space-y-2 overflow-y-auto pr-1" style={{ maxHeight: "min(34vh, 280px)" }}>
+                {pausedTickets.map((ticket) => {
+                  const { clientColor, clientName } = getTicketClientMeta(ticket);
+                  const remainingEffort = roundHalf(getRemainingEffortHours(ticket));
+                  const workedEffort = roundHalf(getWorkedEffortHours(ticket));
+                  const pausedAt = ticket.paused_at && moment(ticket.paused_at).isValid()
+                    ? moment(ticket.paused_at).format("DD/MM HH:mm")
+                    : "";
+
+                  return (
+                    <div
+                      key={ticket.id}
+                      className="flex flex-col gap-2 rounded-xl border border-amber-200/80 bg-card/95 p-2.5 shadow-[var(--shadow-soft)] md:flex-row md:items-center md:justify-between dark:border-amber-500/25"
+                      style={{ borderLeftWidth: 4, borderLeftColor: clientColor }}
+                    >
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="rounded-full border border-amber-200 bg-amber-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800 dark:border-amber-500/35 dark:bg-amber-500/15 dark:text-amber-200">
+                            In pausa
+                          </span>
+                          <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+                            <Clock className="h-3 w-3" />
+                            Rimanente {remainingEffort}h
+                          </span>
+                          {pausedAt && (
+                            <span className="text-[11px] text-muted-foreground">dal {pausedAt}</span>
+                          )}
+                        </div>
+                        <Link
+                          to={buildTicketDetailUrl(ticket.id, activeDeveloperId)}
+                          className="mt-1 block truncate text-sm font-semibold text-foreground hover:underline"
+                        >
+                          {ticket.title}
+                        </Link>
+                        <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                          <span className="inline-flex items-center gap-1 font-medium">
+                            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: clientColor }} />
+                            {clientName}
+                          </span>
+                          <span>Lavorato {workedEffort}h</span>
+                        </div>
+                      </div>
+
+                      <div className="flex shrink-0 items-center gap-2 md:justify-end">
+                        <Button asChild variant="outline" size="sm" className="h-8 rounded-full px-3 text-xs">
+                          <Link to={buildTicketDetailUrl(ticket.id, activeDeveloperId)}>Apri</Link>
+                        </Button>
+                        <Button
+                          type="button"
+                          size="icon"
+                          className="h-8 w-8 rounded-full bg-violet-600 text-white hover:bg-violet-700"
+                          title="Riprendi ticket"
+                          onClick={() => openResumePausedTicketDialog(ticket)}
+                          disabled={Boolean(resumingPausedTicketId)}
+                        >
+                          {resumingPausedTicketId === ticket.id
+                            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            : <Play className="h-3.5 w-3.5" />}
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </Card>
+      )}
 
       {inProgressReminders.length > 0 && (
         <Card className="shrink-0 border-amber-200 bg-amber-50/85 p-2.5 shadow-[var(--shadow-soft)] dark:border-amber-500/30 dark:bg-amber-500/10">
@@ -2939,19 +4701,38 @@ export default function DevPipeline() {
                             const { clientColor, clientName } = getTicketClientMeta(ticket);
 
                             return (
-                              <Link
+                              <div
                                 key={`${ticket.id}-${dateStr}-${isContinuation ? "cont" : "main"}-${idx}`}
-                                to={buildTicketDetailUrl(ticket.id, activeDeveloperId)}
-                                className="app-hover-lift block rounded-xl border border-border/70 bg-card p-3"
+                                className="app-hover-lift group rounded-xl border border-border/70 bg-card p-3"
                                 style={{ borderLeftWidth: 4, borderLeftColor: clientColor }}
                               >
                                 <div className="flex items-start justify-between gap-2">
-                                  <p className="text-xs font-semibold text-foreground line-clamp-2">{ticket.title}</p>
-                                  <span className={`text-[9px] px-1.5 py-0.5 rounded-md border font-semibold whitespace-nowrap ${status.color}`}>
-                                    {status.label}
-                                  </span>
+                                  <Link
+                                    to={buildTicketDetailUrl(ticket.id, activeDeveloperId)}
+                                    className="min-w-0 flex-1 text-xs font-semibold text-foreground line-clamp-2 hover:underline"
+                                  >
+                                    {ticket.title}
+                                  </Link>
+                                  <div className="flex shrink-0 items-center gap-1">
+                                    {canChangePipelineStatusForTicket(ticket) ? (
+                                      <PipelineStatusMenu
+                                        ticket={ticket}
+                                        disabled={changingStatusTicketId === ticket.id}
+                                        onStatusChange={requestPipelineStatusChange}
+                                        label={status.label}
+                                        className="whitespace-nowrap normal-case tracking-normal"
+                                      />
+                                    ) : (
+                                      <span className={`text-[9px] px-1.5 py-0.5 rounded-md border font-semibold whitespace-nowrap ${status.color}`}>
+                                        {status.label}
+                                      </span>
+                                    )}
+                                  </div>
                                 </div>
-                                <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground">
+                                <Link
+                                  to={buildTicketDetailUrl(ticket.id, activeDeveloperId)}
+                                  className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground hover:text-foreground"
+                                >
                                   <span className="inline-flex items-center gap-1 font-medium">
                                     <span className="w-2 h-2 rounded-full" style={{ backgroundColor: clientColor }} />
                                     {clientName}
@@ -2962,8 +4743,8 @@ export default function DevPipeline() {
                                     {decimalToTime(startHour)}-{decimalToTime(endHour)}
                                   </span>
                                   <span className="font-medium">{durationH}h</span>
-                                </div>
-                              </Link>
+                                </Link>
+                              </div>
                             );
                           })}
                         </div>
@@ -3175,6 +4956,9 @@ export default function DevPipeline() {
                               clientName={clientName}
                               viewDeveloperId={activeDeveloperId}
                               overlap={overlapLayout[overlapKey]}
+                              canChangeStatus={canChangePipelineStatusForTicket(ticket)}
+                              isChangingStatus={changingStatusTicketId === ticket.id}
+                              onStatusChange={requestPipelineStatusChange}
                             />
                           );
                         })}
@@ -3297,6 +5081,9 @@ function TicketBlock({
   clientName = "No client",
   viewDeveloperId = "",
   overlap,
+  canChangeStatus = false,
+  isChangingStatus = false,
+  onStatusChange,
 }) {
   const normalizedStatus = getTicketWorkflowStatus(ticket);
   const status = STATUS_CONFIG[normalizedStatus] || STATUS_CONFIG.new;
@@ -3353,6 +5140,23 @@ function TicketBlock({
       }}
       title={ticketTooltip}
     >
+      {canChangeStatus && (
+        <div
+          className={cn(
+            "absolute z-30",
+            isMicro ? "right-1 top-1/2 -translate-y-1/2" : "right-1 top-1"
+          )}
+        >
+          <PipelineStatusMenu
+            ticket={ticket}
+            disabled={isChangingStatus}
+            onStatusChange={onStatusChange}
+            label={statusCompactLabel}
+            compact
+            className={isMicro ? "max-w-[64px] px-1" : "max-w-[74px]"}
+          />
+        </div>
+      )}
       <Link to={buildTicketDetailUrl(ticket.id, viewDeveloperId)} className="relative block h-full">
         <span className={`absolute left-0 top-0 h-[2px] w-full ${statusAccentClass} opacity-70`} />
         {isMicro ? (
@@ -3369,7 +5173,11 @@ function TicketBlock({
             <p className="text-[10px] font-semibold text-foreground truncate flex-1 leading-none">
               {ticket.title}
             </p>
-            <span className={`text-[7px] px-1 py-0.5 rounded-md border font-semibold uppercase tracking-wide max-w-[64px] truncate ${status.color}`}>
+            <span className={cn(
+              "text-[7px] px-1 py-0.5 rounded-md border font-semibold uppercase tracking-wide max-w-[64px] truncate",
+              status.color,
+              canChangeStatus && "invisible pointer-events-none"
+            )}>
               {statusCompactLabel}
             </span>
           </div>
@@ -3391,7 +5199,11 @@ function TicketBlock({
                     Urgente
                   </span>
                 )}
-                <span className={`text-[7px] px-1.5 py-0.5 rounded-md border font-semibold uppercase tracking-wide max-w-[74px] truncate ${status.color}`}>
+                <span className={cn(
+                  "text-[7px] px-1.5 py-0.5 rounded-md border font-semibold uppercase tracking-wide max-w-[74px] truncate",
+                  status.color,
+                  canChangeStatus && "invisible pointer-events-none"
+                )}>
                   {statusCompactLabel}
                 </span>
               </div>
@@ -3416,7 +5228,11 @@ function TicketBlock({
                     Urgente
                   </span>
                 )}
-                <span className={`text-[7px] px-1.5 py-0.5 rounded-md border font-semibold uppercase tracking-wide max-w-[74px] truncate ${status.color}`}>
+                <span className={cn(
+                  "text-[7px] px-1.5 py-0.5 rounded-md border font-semibold uppercase tracking-wide max-w-[74px] truncate",
+                  status.color,
+                  canChangeStatus && "invisible pointer-events-none"
+                )}>
                   {statusCompactLabel}
                 </span>
                 {isDeadlinePast && <AlertTriangle className="w-2 h-2 text-red-500" />}

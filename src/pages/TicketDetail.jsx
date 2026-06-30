@@ -894,6 +894,7 @@ export default function TicketDetail() {
   const [deadlineInput, setDeadlineInput] = useState("");
   const [savingDeadline, setSavingDeadline] = useState(false);
   const [inProgressConflict, setInProgressConflict] = useState(null); // { nowTime, plannedTime }
+  const [inProgressBlockDialog, setInProgressBlockDialog] = useState(null);
   const [resumePauseDialog, setResumePauseDialog] = useState(null);
   const [resumeRemainingInput, setResumeRemainingInput] = useState("");
   const [doneConflict, setDoneConflict] = useState(null); // { status, nowDate, nowTime, plannedDate, plannedTime }
@@ -1084,6 +1085,22 @@ export default function TicketDetail() {
     }
 
     await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+  };
+
+  const findConcurrentInProgressTicket = (sourceTicket, sourceTickets = tickets) => {
+    if (!sourceTicket?.assignee_id) return null;
+    return (sourceTickets || []).find(
+      (entry) =>
+        entry?.id &&
+        entry.id !== sourceTicket.id &&
+        entry.assignee_id === sourceTicket.assignee_id &&
+        normalizeTicketStatus(entry.status) === "in_progress"
+    ) || null;
+  };
+
+  const openInProgressBlockDialog = (sourceTicket, activeTicket) => {
+    if (!sourceTicket?.id || !activeTicket?.id) return;
+    setInProgressBlockDialog({ ticket: sourceTicket, activeTicket });
   };
 
   const buildAuditEntry = (action, details) => ({
@@ -2638,6 +2655,13 @@ export default function TicketDetail() {
     let resolvedCompletionTimeForRebalance = null;
 
     if (newStatus === "in_progress") {
+      const latestTickets = await appClient.entities.Ticket.list();
+      const activeInProgressTicket = findConcurrentInProgressTicket(ticket, latestTickets);
+      if (activeInProgressTicket) {
+        openInProgressBlockDialog(ticket, activeInProgressTicket);
+        return false;
+      }
+
       const selectedStartTime = overrideStartTime || ticket.start_time || nowTime;
       const movingToNow = selectedStartTime === nowTime;
       const selectedStartDate = movingToNow
@@ -2666,7 +2690,7 @@ export default function TicketDetail() {
           title: "Orario non disponibile",
           description: "Il ticket non puo iniziare in una fascia bloccata impostata in disponibilita.",
         });
-        return;
+        return false;
       }
 
       const splitSchedule = buildInProgressSchedule(
@@ -2729,7 +2753,6 @@ export default function TicketDetail() {
             status: newStatus,
           });
       if (candidateSegments.length > 0) {
-        const latestTickets = await appClient.entities.Ticket.list();
         for (const segment of candidateSegments) {
           const conflict = checkScheduleConflict(
             latestTickets,
@@ -2752,7 +2775,7 @@ export default function TicketDetail() {
               title: "Slot gia occupato",
               description: `${conflict.message}${suggestion}`,
             });
-            return;
+            return false;
           }
         }
       }
@@ -2863,7 +2886,7 @@ export default function TicketDetail() {
               }
             : {}),
         });
-        return;
+        return true;
       }
 
       const reactivationDeveloper = resolveTicketAssigneeDeveloper(ticket);
@@ -2875,7 +2898,7 @@ export default function TicketDetail() {
         });
         await queryClient.invalidateQueries({ queryKey: ["ticket", ticketId] });
         await queryClient.invalidateQueries({ queryKey: ["tickets"] });
-        return;
+        return true;
       }
 
       await applyRebalanceForDevelopers([ticket.assignee_id], {
@@ -2893,7 +2916,7 @@ export default function TicketDetail() {
           start: nowInfo.roundedDecimal ?? DAY_START,
         },
       });
-      return;
+      return true;
     }
 
     if (newStatus === "in_progress" && ticket.assignee_id) {
@@ -2916,7 +2939,7 @@ export default function TicketDetail() {
             }
           : {}),
       });
-      return;
+      return true;
     }
 
     const rebalanceOptions = isCompletionStatus && !wasCompletionStatus
@@ -2948,10 +2971,12 @@ export default function TicketDetail() {
       : {};
 
     await applyRebalanceForDevelopers([ticket.assignee_id], rebalanceOptions);
+    return true;
   };
 
   const finalizeStatusChange = async (newStatus, options = {}) => {
-    await doStatusChange(newStatus, options);
+    const updated = await doStatusChange(newStatus, options);
+    if (updated === false) return false;
 
     await notifyClientSupervisor({
       ticketOverride: { ...ticket, status: newStatus },
@@ -2975,9 +3000,19 @@ export default function TicketDetail() {
         body: `Il ticket "${ticket.title}" è stato concluso con stato ${newStatus}.`,
       }).catch(() => {});
     }
+
+    return true;
   };
 
   const handleStatusChange = async (newStatus) => {
+    if (newStatus === "in_progress") {
+      const activeInProgressTicket = findConcurrentInProgressTicket(ticket);
+      if (activeInProgressTicket) {
+        openInProgressBlockDialog(ticket, activeInProgressTicket);
+        return;
+      }
+    }
+
     if (newStatus === "qa_review" && ticketKind === "main") {
       const existingPreviewLinks = resolveQaPreviewEntries(ticket);
       setQaRequestForm({
@@ -4587,6 +4622,77 @@ export default function TicketDetail() {
                 }}
               >
                 Riprendi e ripianifica
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {inProgressBlockDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-border/70 bg-card p-6 shadow-xl">
+            <div className="flex items-start gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-violet-100 dark:bg-violet-500/15">
+                <AlertTriangle className="h-5 w-5 text-violet-600 dark:text-violet-300" />
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-foreground">Ticket gia in progress</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  Non puoi avere piu ticket in progress contemporaneamente. Chiudi, metti in pausa o sposta prima quello gia attivo.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 rounded-xl border border-violet-200 bg-violet-50/70 p-4 dark:border-violet-500/30 dark:bg-violet-500/10">
+              {(() => {
+                const activeTicket = inProgressBlockDialog.activeTicket;
+                const client = clients.find(
+                  (entry) =>
+                    entry.id === activeTicket.client_id ||
+                    String(entry.name || "").toLowerCase() === String(activeTicket.client_name || "").toLowerCase()
+                );
+                const segments = getTicketScheduleSegments(activeTicket);
+                const lastSegment = segments[segments.length - 1] || null;
+                const plannedEnd = lastSegment
+                  ? `${moment(lastSegment.date, "YYYY-MM-DD", true).isValid() ? moment(lastSegment.date, "YYYY-MM-DD").format("DD/MM") : lastSegment.date} ${decimalToTime(lastSegment.end)}`
+                  : "";
+
+                return (
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-full border border-violet-200 bg-violet-100 px-2 py-0.5 text-[10px] font-semibold text-violet-800 dark:border-violet-500/35 dark:bg-violet-500/15 dark:text-violet-200">
+                        In progress
+                      </span>
+                      <span className="text-[11px] font-medium text-muted-foreground">
+                        {activeTicket.client_name || client?.name || "Cliente non indicato"}
+                      </span>
+                    </div>
+                    <p className="mt-2 truncate text-sm font-semibold text-foreground">
+                      {activeTicket.title}
+                    </p>
+                    {plannedEnd && (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Fine prevista: {plannedEnd}
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+
+            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setInProgressBlockDialog(null)}
+              >
+                Chiudi
+              </Button>
+              <Button asChild size="sm" onClick={() => setInProgressBlockDialog(null)}>
+                <Link to={buildTicketUrl(inProgressBlockDialog.activeTicket.id)}>
+                  Apri ticket attivo
+                </Link>
               </Button>
             </div>
           </div>
