@@ -22,7 +22,7 @@ import {
 import BacklogTable from "../components/dashboard/BacklogTable";
 import KanbanBoard from "../components/pipeline/KanbanBoard";
 import CapacityBoard from "../components/capacity/CapacityBoard";
-import { buildWeeklyRebalanceUpdates, checkScheduleConflict, getDynamicRebalanceOptions } from "./DevPipeline";
+import { buildWeeklyRebalanceUpdates, checkScheduleConflict, getDynamicRebalanceOptions, getPauseRebalanceOptions } from "./DevPipeline";
 import moment from "moment";
 import { useCurrentUser } from "../components/shared/useCurrentUser";
 import usePersistedState from "../components/shared/usePersistedState";
@@ -456,7 +456,11 @@ export default function Dashboard() {
     if (ticket.assignee_id) {
       const latestTickets = await appClient.entities.Ticket.list();
       const dev = developers.find((d) => d.id === ticket.assignee_id) || null;
-      const rebalanceOptions = isCompletion
+      const rebalanceOptions = newStatus === "blocked"
+        ? getPauseRebalanceOptions(ticket, {
+            excludePausedTicket: !pauseSnapshot || pauseWorkedEffort <= 0,
+          })
+        : isCompletion
         ? getDynamicRebalanceOptions({
             includeTodayHoles: true,
             planningStartDate: moment().format("YYYY-MM-DD"),

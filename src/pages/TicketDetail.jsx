@@ -39,6 +39,7 @@ import {
   checkScheduleConflict,
   findOptimalSchedule,
   getDynamicRebalanceOptions,
+  getPauseRebalanceOptions,
   getDeveloperUnavailableIntervalsByDate,
 } from "./DevPipeline";
 import { useCurrentUser } from "../components/shared/useCurrentUser";
@@ -2653,6 +2654,7 @@ export default function TicketDetail() {
     const lifecycleData = {};
     let resolvedCompletionDateForRebalance = null;
     let resolvedCompletionTimeForRebalance = null;
+    let pauseRebalanceOptions = null;
 
     if (newStatus === "in_progress") {
       const latestTickets = await appClient.entities.Ticket.list();
@@ -2784,6 +2786,9 @@ export default function TicketDetail() {
       const pauseSnapshot = previousStatus === "in_progress"
         ? buildPauseScheduleSnapshot(ticket, nowInfo.date, nowInfo.roundedTime || nowInfo.time)
         : null;
+      pauseRebalanceOptions = getPauseRebalanceOptions(ticket, {
+        excludePausedTicket: !pauseSnapshot || pauseSnapshot.workedEffort <= 0,
+      });
 
       if (pauseSnapshot) {
         Object.assign(timeData, pauseSnapshot.schedule);
@@ -2942,7 +2947,9 @@ export default function TicketDetail() {
       return true;
     }
 
-    const rebalanceOptions = isCompletionStatus && !wasCompletionStatus
+    const rebalanceOptions = newStatus === "blocked"
+      ? pauseRebalanceOptions || getPauseRebalanceOptions(ticket)
+      : isCompletionStatus && !wasCompletionStatus
       ? (() => {
           if (completionMode === "planned") {
             return {
@@ -4152,8 +4159,6 @@ export default function TicketDetail() {
           client,
           config
     );
-    const currentScheduleSegments = getTicketScheduleSegments(ticket);
-    const anchorSegment = currentScheduleSegments[0] || null;
     const nowInfo = getNowInRome();
     const pauseSnapshot = nextPaused && currentStatus === "in_progress"
       ? buildPauseScheduleSnapshot(ticket, nowInfo.date, nowInfo.roundedTime || nowInfo.time)
@@ -4229,26 +4234,10 @@ export default function TicketDetail() {
     }
 
     if (nextPaused) {
-      await applyRebalanceForDevelopers([ticket.assignee_id], {
-        preserveWorkingDaysFromToday: 0,
-        preserveExistingSequence: true,
-        includeTodayHoles: true,
-        freezeCurrentWeekSegments: false,
-        preserveTodaySegments: false,
-        allowInProgressReplan: true,
+      await applyRebalanceForDevelopers([ticket.assignee_id], getPauseRebalanceOptions(ticket, {
+        excludePausedTicket: !pauseSnapshot || pauseSnapshot.workedEffort <= 0,
         forceLastTicketIds: [ticket.id],
-        ...(anchorSegment
-          ? {
-              planningStartDate: anchorSegment.date,
-              manualInsertionAnchor: {
-                date: anchorSegment.date,
-                start: anchorSegment.start,
-              },
-            }
-          : {
-              planningStartDate: moment().format("YYYY-MM-DD"),
-            }),
-      });
+      }));
     } else {
       const reactivationDeveloper = resolveTicketAssigneeDeveloper(ticket);
       if (reactivationDeveloper) {
