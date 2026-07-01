@@ -6,7 +6,7 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { ChevronDown, ChevronLeft, ChevronRight, AlertTriangle, Clock, Check, FileDown, Loader2, PauseCircle, Pencil, Play, SlidersHorizontal } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, AlertTriangle, Clock, Check, FileDown, Loader2, PauseCircle, Pencil, Play, RefreshCw, SlidersHorizontal } from "lucide-react";
 import { toast } from "@/components/ui/use-toast";
 import { Link, useSearchParams } from "react-router-dom";
 import { createPageUrl, isDeveloperLikeRole } from "@/utils";
@@ -744,6 +744,40 @@ function getAllTicketSegments(ticket) {
   const main = toMainSegment(ticket);
   const segments = main ? [main, ...toContinuationSegments(ticket)] : [...toContinuationSegments(ticket)];
   return normalizeTicketSegments(segments);
+}
+
+export function getPauseRebalanceOptions(ticket, options = {}) {
+  const {
+    excludePausedTicket = false,
+    excludeTicketIds = [],
+    ...overrides
+  } = options || {};
+  const anchorSegment = sortSegments(getAllTicketSegments(ticket))[0] || null;
+  const excludedIds = [
+    ...excludeTicketIds,
+    ...(excludePausedTicket && ticket?.id ? [ticket.id] : []),
+  ].filter(Boolean);
+
+  return getDynamicRebalanceOptions({
+    preserveWorkingDaysFromToday: 0,
+    preserveExistingSequence: true,
+    includeTodayHoles: true,
+    freezeCurrentWeekSegments: false,
+    preserveTodaySegments: false,
+    preserveElapsedTodaySegments: true,
+    allowInProgressReplan: true,
+    ...(excludedIds.length > 0 ? { excludeTicketIds: excludedIds } : {}),
+    ...(anchorSegment
+      ? {
+          planningStartDate: anchorSegment.date,
+          manualInsertionAnchor: {
+            date: anchorSegment.date,
+            start: anchorSegment.start,
+          },
+        }
+      : {}),
+    ...overrides,
+  });
 }
 
 function getWorkedTicketSegments(ticket) {
@@ -1893,6 +1927,7 @@ export function buildWeeklyRebalanceUpdates(
     preserveExistingSequence = false,
     forceFirstTicketIds = [],
     forceLastTicketIds = [],
+    excludeTicketIds = [],
   } = {}
 ) {
   const todayMoment = moment().startOf("day");
@@ -1917,9 +1952,11 @@ export function buildWeeklyRebalanceUpdates(
   const frozenTicketSet = new Set((freezeTicketIds || []).filter(Boolean));
   const forceFirstTicketSet = new Set((forceFirstTicketIds || []).filter(Boolean));
   const forceLastTicketSet = new Set((forceLastTicketIds || []).filter(Boolean));
+  const excludedTicketSet = new Set((excludeTicketIds || []).filter(Boolean));
 
   const devTickets = (allTickets || []).filter(
     (ticket) =>
+      !excludedTicketSet.has(ticket.id) &&
       ticket.assignee_id === devId &&
       (isSchedulableTicket(ticket) || hasWorkedSchedule(ticket))
   );
@@ -2181,6 +2218,16 @@ export function buildVisibleWeekCompactionUpdates(
   const weekStart = moment(weekStartDate, "YYYY-MM-DD", true);
   if (!weekStart.isValid()) return [];
   const weekEnd = weekStart.clone().add(weekDays - 1, "day");
+  const todayMoment = moment().startOf("day");
+  if (weekEnd.isBefore(todayMoment, "day")) return [];
+  const compactStartMoment = moment.max(weekStart.clone(), todayMoment.clone());
+  const compactStartDate = compactStartMoment.format("YYYY-MM-DD");
+  const compactStartDecimal = compactStartDate === todayMoment.format("YYYY-MM-DD")
+    ? Math.min(DAY_END, Math.max(DAY_START, currentTimeDecimal()))
+    : DAY_START;
+  const compactStartBoundary = compactStartDate === todayMoment.format("YYYY-MM-DD")
+    ? ceilHalf(compactStartDecimal)
+    : DAY_START;
 
   const devTickets = (allTickets || []).filter(
     (ticket) => ticket.assignee_id === devId && isSchedulableTicket(ticket)
@@ -2188,12 +2235,46 @@ export function buildVisibleWeekCompactionUpdates(
   if (devTickets.length === 0) return [];
 
   const lockedIntervalsByDate = {};
-  const preservedOutsideWeekByTicket = {};
+  const preservedSegmentsByTicket = {};
   const weekEffortByTicket = {};
+  const sequenceByTicket = {};
   const unavailableIntervalsByDate = getDeveloperUnavailableIntervalsByDate(dev, {
-    fromDate: weekStart.format("YYYY-MM-DD"),
+    fromDate: compactStartDate,
     toDate: weekEnd.format("YYYY-MM-DD"),
   });
+
+  const preserveSegment = (ticket, segment, { lock = false } = {}) => {
+    if (!preservedSegmentsByTicket[ticket.id]) {
+      preservedSegmentsByTicket[ticket.id] = [];
+    }
+    preservedSegmentsByTicket[ticket.id].push(segment);
+
+    if (!lock) return;
+    if (!lockedIntervalsByDate[segment.date]) {
+      lockedIntervalsByDate[segment.date] = [];
+    }
+    lockedIntervalsByDate[segment.date].push({
+      start: segment.start,
+      end: segment.end,
+    });
+  };
+
+  const noteSequence = (ticket, segment) => {
+    const next = {
+      date: String(segment.date || "9999-12-31"),
+      start: Number(segment.start),
+      created: Date.parse(ticket?.created_date || "") || Number.POSITIVE_INFINITY,
+      id: String(ticket?.id || ""),
+    };
+    const current = sequenceByTicket[ticket.id];
+    if (
+      !current ||
+      next.date < current.date ||
+      (next.date === current.date && next.start < current.start)
+    ) {
+      sequenceByTicket[ticket.id] = next;
+    }
+  };
 
   devTickets.forEach((ticket) => {
     const segments = getAllTicketSegments(ticket);
@@ -2204,28 +2285,20 @@ export function buildVisibleWeekCompactionUpdates(
       const inWeek = segmentMoment.isValid() && segmentMoment.isBetween(weekStart, weekEnd, "day", "[]");
 
       if (!inWeek) {
-        if (!preservedOutsideWeekByTicket[ticket.id]) {
-          preservedOutsideWeekByTicket[ticket.id] = [];
-        }
-        preservedOutsideWeekByTicket[ticket.id].push(segment);
+        preserveSegment(ticket, segment);
         return;
       }
 
-      if (lockWholeInWeek) {
-        if (!lockedIntervalsByDate[segment.date]) {
-          lockedIntervalsByDate[segment.date] = [];
-        }
-        lockedIntervalsByDate[segment.date].push({
-          start: segment.start,
-          end: segment.end,
-        });
-        if (!preservedOutsideWeekByTicket[ticket.id]) {
-          preservedOutsideWeekByTicket[ticket.id] = [];
-        }
-        preservedOutsideWeekByTicket[ticket.id].push(segment);
+      const beforeCompactStart =
+        String(segment.date || "") < compactStartDate ||
+        (String(segment.date || "") === compactStartDate && Number(segment.start) < compactStartBoundary);
+
+      if (lockWholeInWeek || beforeCompactStart) {
+        preserveSegment(ticket, segment, { lock: true });
         return;
       }
 
+      noteSequence(ticket, segment);
       weekEffortByTicket[ticket.id] = roundHalf(
         (weekEffortByTicket[ticket.id] || 0) + segmentDuration(segment)
       );
@@ -2241,6 +2314,7 @@ export function buildVisibleWeekCompactionUpdates(
     const date = weekStart.clone().add(i, "day");
     const dateStr = date.format("YYYY-MM-DD");
     if (date.isoWeekday() > 5) continue;
+    if (date.isBefore(compactStartMoment, "day")) continue;
 
     if (!lockedIntervalsByDate[dateStr]) {
       lockedIntervalsByDate[dateStr] = [];
@@ -2249,28 +2323,37 @@ export function buildVisibleWeekCompactionUpdates(
     lockedIntervalsByDate[dateStr] = normalizeIntervals(lockedIntervalsByDate[dateStr]);
 
     const daySlots = buildFreeSlotsForDay(dateStr, lockedIntervalsByDate[dateStr] || [], {
-      isToday: false,
+      isToday: dateStr === compactStartDate,
       includeTodayHoles: true,
-      nowDecimal: DAY_START,
+      nowDecimal: compactStartBoundary,
     });
     freeSlots.push(...daySlots);
   }
   if (freeSlots.length === 0) return [];
 
+  const totalFreeHours = roundHalf(
+    freeSlots.reduce((sum, slot) => sum + Math.max(0, Number(slot.end) - Number(slot.start)), 0)
+  );
+  const totalEffortHours = roundHalf(
+    Object.values(weekEffortByTicket).reduce((sum, effort) => sum + (Number(effort) || 0), 0)
+  );
+  if (totalEffortHours <= 0 || totalFreeHours < totalEffortHours) return [];
+
   const replannableTickets = devTickets
     .filter((ticket) => (weekEffortByTicket[ticket.id] || 0) > 0)
     .sort((a, b) => {
-      const urgencyOrder = compareTicketUrgency(a, b);
-      if (urgencyOrder !== 0) return urgencyOrder;
-      const priorityA = getEffectivePriorityScore(a);
-      const priorityB = getEffectivePriorityScore(b);
-      if (priorityB !== priorityA) return priorityB - priorityA;
-      const deadlineA = getDeadlineSortValue(a);
-      const deadlineB = getDeadlineSortValue(b);
-      if (deadlineA !== deadlineB) return deadlineA - deadlineB;
-      const createdA = Date.parse(a.created_date || "") || 0;
-      const createdB = Date.parse(b.created_date || "") || 0;
-      return createdA - createdB;
+      const sequenceA = sequenceByTicket[a.id] || {};
+      const sequenceB = sequenceByTicket[b.id] || {};
+      if (sequenceA.date !== sequenceB.date) {
+        return String(sequenceA.date || "9999-12-31").localeCompare(String(sequenceB.date || "9999-12-31"));
+      }
+      if (sequenceA.start !== sequenceB.start) {
+        return (Number(sequenceA.start) || Number.POSITIVE_INFINITY) - (Number(sequenceB.start) || Number.POSITIVE_INFINITY);
+      }
+      if (sequenceA.created !== sequenceB.created) {
+        return (Number(sequenceA.created) || Number.POSITIVE_INFINITY) - (Number(sequenceB.created) || Number.POSITIVE_INFINITY);
+      }
+      return String(a.id || "").localeCompare(String(b.id || ""));
     });
 
   const mutableSlots = freeSlots.map((slot) => ({ ...slot }));
@@ -2304,9 +2387,9 @@ export function buildVisibleWeekCompactionUpdates(
 
   const updates = [];
   devTickets.forEach((ticket) => {
-    const preservedOutsideWeek = sortSegments(preservedOutsideWeekByTicket[ticket.id] || []);
+    const preservedSegments = sortSegments(preservedSegmentsByTicket[ticket.id] || []);
     const allocatedInWeek = sortSegments(allocatedByTicket[ticket.id] || []);
-    const nextSegments = sortSegments([...preservedOutsideWeek, ...allocatedInWeek]);
+    const nextSegments = sortSegments([...preservedSegments, ...allocatedInWeek]);
     const nextSchedule = schedulePayloadFromSegments(nextSegments);
 
     if (!scheduleChanged(ticket, nextSchedule)) return;
@@ -2337,10 +2420,12 @@ export default function DevPipeline() {
   const [deadlineExtensionInput, setDeadlineExtensionInput] = useState("0.5");
   const [updatingDeadlineWarning, setUpdatingDeadlineWarning] = useState(false);
   const [seenDeadlineWarningKeys, setSeenDeadlineWarningKeys] = useState([]);
+  const [seenDeadlineWarningStorageKey, setSeenDeadlineWarningStorageKey] = useState("");
   const [pipelineStartConflict, setPipelineStartConflict] = useState(null);
   const [pipelineCompletionConflict, setPipelineCompletionConflict] = useState(null);
   const [inProgressBlockDialog, setInProgressBlockDialog] = useState(null);
   const [changingStatusTicketId, setChangingStatusTicketId] = useState("");
+  const [compactingPipeline, setCompactingPipeline] = useState(false);
   const staleRebalanceSignatureRef = useRef("");
   const urgentRebalanceSignatureRef = useRef("");
   const queryClient = useQueryClient();
@@ -2457,7 +2542,10 @@ export default function DevPipeline() {
 
   useEffect(() => {
     setSeenDeadlineWarningKeys(readStoredStringList(deadlineWarningStorageKey));
+    setSeenDeadlineWarningStorageKey(deadlineWarningStorageKey);
   }, [deadlineWarningStorageKey]);
+
+  const deadlineWarningStorageReady = seenDeadlineWarningStorageKey === deadlineWarningStorageKey;
 
   const selectableDevelopers = useMemo(
     () => (canViewAllPipelines ? activeDevs : loggedDeveloper ? [loggedDeveloper] : []),
@@ -2721,6 +2809,7 @@ export default function DevPipeline() {
       .sort((a, b) => String(a.info.plannedEndLabel).localeCompare(String(b.info.plannedEndLabel)));
   }, [currentTime, dismissedInProgressReminderIds, tickets, visibleDeveloperIds]);
   const inProgressDeadlineWarnings = useMemo(() => {
+    if (!deadlineWarningStorageReady) return [];
     if (!loggedDeveloper?.id) return [];
     const seenKeys = new Set(seenDeadlineWarningKeys);
     const todayStr = moment().format("YYYY-MM-DD");
@@ -2734,7 +2823,7 @@ export default function DevPipeline() {
       })
       .filter((entry) => entry.info && entry.key && !seenKeys.has(entry.key))
       .sort((a, b) => a.info.minutesRemaining - b.info.minutesRemaining);
-  }, [currentTime, loggedDeveloper?.id, seenDeadlineWarningKeys, tickets]);
+  }, [currentTime, deadlineWarningStorageReady, loggedDeveloper?.id, seenDeadlineWarningKeys, tickets]);
   const canDownloadTimesheet =
     Boolean(activeDeveloper) &&
     (isAdmin || (loggedDeveloper && activeDeveloper?.id === loggedDeveloper.id));
@@ -2774,6 +2863,7 @@ export default function DevPipeline() {
 
   const markDeadlineWarningSeen = (warningKey) => {
     if (!warningKey) return;
+    setSeenDeadlineWarningStorageKey(deadlineWarningStorageKey);
     setSeenDeadlineWarningKeys((current) => {
       if (current.includes(warningKey)) return current;
       const next = [...current, warningKey].slice(-250);
@@ -3358,6 +3448,7 @@ export default function DevPipeline() {
       !isCompletionStatus;
     let resolvedCompletionDateForRebalance = null;
     let resolvedCompletionTimeForRebalance = null;
+    let pauseRebalanceOptions = null;
 
     if (normalizedNewStatus === "in_progress") {
       if (!ticket.assignee_id) {
@@ -3499,6 +3590,9 @@ export default function DevPipeline() {
       const pauseSnapshot = previousStatus === "in_progress"
         ? buildPauseScheduleSnapshot(ticket, nowInfo.date, nowInfo.roundedTime || nowInfo.time)
         : null;
+      pauseRebalanceOptions = getPauseRebalanceOptions(ticket, {
+        excludePausedTicket: !pauseSnapshot || pauseSnapshot.workedEffort <= 0,
+      });
 
       if (pauseSnapshot) {
         Object.assign(timeData, pauseSnapshot.schedule);
@@ -3651,6 +3745,12 @@ export default function DevPipeline() {
             start: nowInfo.roundedDecimal ?? DAY_START,
           },
         });
+      } else if (normalizedNewStatus === "blocked") {
+        await applyDeveloperRebalance(
+          ticket.assignee_id,
+          dev,
+          pauseRebalanceOptions || getPauseRebalanceOptions(ticket)
+        );
       } else if (isCompletionStatus && !wasCompletionStatus) {
         if (completionMode === "planned") {
           await applyDeveloperRebalance(ticket.assignee_id, dev, {
@@ -3899,6 +3999,49 @@ export default function DevPipeline() {
       title: "Timesheet esportato",
       description: `${rows.length} clienti inclusi per ${activeDeveloper.name}.`,
     });
+  };
+
+  const handleCompactPipeline = async () => {
+    if (!activeDeveloper || compactingPipeline) return;
+
+    setCompactingPipeline(true);
+    try {
+      const latestTickets = await appClient.entities.Ticket.list();
+      const updates = buildVisibleWeekCompactionUpdates(
+        latestTickets,
+        activeDeveloper.id,
+        startOfWeek.format("YYYY-MM-DD"),
+        activeDeveloper,
+        { weekDays: DEFAULT_REBALANCE_HORIZON_DAYS }
+      );
+
+      if (updates.length === 0) {
+        toast({
+          title: "Pipeline gia compatta",
+          description: "Non ci sono buchi utili da riempire dalla settimana selezionata in avanti.",
+        });
+        return;
+      }
+
+      await Promise.all(
+        updates.map((entry) => appClient.entities.Ticket.update(entry.id, entry.updates))
+      );
+      await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+
+      toast({
+        title: "Pipeline aggiornata",
+        description: `${updates.length} ticket spostati senza cambiare l'ordine.`,
+      });
+    } catch (error) {
+      console.error("Pipeline compaction failed", error);
+      toast({
+        variant: "destructive",
+        title: "Aggiornamento non riuscito",
+        description: "Non sono riuscito a compattare la pipeline. Riprova tra poco.",
+      });
+    } finally {
+      setCompactingPipeline(false);
+    }
   };
 
   return (
@@ -4365,6 +4508,20 @@ export default function DevPipeline() {
                 </div>
               </PopoverContent>
             </Popover>
+
+            <Button
+              variant="outline"
+              className="h-7 rounded-full px-3 text-xs font-medium"
+              onClick={handleCompactPipeline}
+              disabled={!activeDeveloper || compactingPipeline}
+            >
+              {compactingPipeline ? (
+                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+              )}
+              Aggiorna pipeline
+            </Button>
 
             <Button
               variant="outline"
