@@ -309,7 +309,28 @@ export default function Dashboard() {
       return;
     }
 
+    const ticketKind = String(ticket?.ticket_kind || "").trim().toLowerCase();
+    if (ticketKind === "qa_fix" && ["qa_review", "done"].includes(normalizedNewStatus)) {
+      toast({
+        title: "Rimanda il fix in QA dal ticket",
+        description: "Apri il QA Fix e usa l'azione Rimanda in QA per creare correttamente il nuovo controllo.",
+      });
+      return;
+    }
+
     const previousStatus = normalizeTicketStatus(ticket.status);
+    if (
+      ["blocked", "new"].includes(previousStatus) &&
+      normalizedNewStatus === "in_progress" &&
+      getWorkedEffortHours(ticket) > 0
+    ) {
+      toast({
+        title: "Conferma l'effort rimanente",
+        description: "Apri il ticket: se c'e gia un'attivita in progress verra reinserito come New subito dopo.",
+      });
+      return;
+    }
+
     if (normalizedNewStatus === "in_progress") {
       const latestTicketsForStatus = await appClient.entities.Ticket.list();
       const activeInProgressTicket = findConcurrentInProgressTicket(ticket, latestTicketsForStatus);
@@ -319,17 +340,6 @@ export default function Dashboard() {
       }
     }
 
-    if (
-      ["blocked", "new"].includes(previousStatus) &&
-      normalizedNewStatus === "in_progress" &&
-      getWorkedEffortHours(ticket) > 0
-    ) {
-      toast({
-        title: "Conferma l'effort rimanente",
-        description: "Apri il ticket per controllare o modificare l'effort residuo prima di riprenderlo.",
-      });
-      return;
-    }
     const isReactivatingFromBlocked =
       previousStatus === "blocked" &&
       normalizedNewStatus !== "blocked" &&
@@ -458,6 +468,8 @@ export default function Dashboard() {
             paused_by: user?.email || user?.full_name || "user",
             paused_by_id: user?.id || null,
             paused_from_status: previousStatus,
+            manual_schedule_locked: false,
+            manual_schedule_locked_at: null,
           }
         : {}),
       ...reactivationData,

@@ -160,10 +160,12 @@ function PipelineStatusMenu({
   const currentStatus = getTicketWorkflowStatus(ticket);
   const currentConfig = STATUS_CONFIG[currentStatus] || STATUS_CONFIG.new;
   const triggerLabel = label || currentConfig.label;
+  const isQaFixTicket = String(ticket?.ticket_kind || "").trim().toLowerCase() === "qa_fix";
   const availableActions = PIPELINE_STATUS_ACTIONS.filter(
     (option) =>
       option.value !== currentStatus &&
       STATUS_CONFIG[option.value] &&
+      !(isQaFixTicket && ["qa_review", "done"].includes(option.value)) &&
       canTransitionTicketStatus(currentStatus, option.value)
   );
 
@@ -699,6 +701,7 @@ function normalizeTicketSegments(segments = []) {
 function getTicketEffort(ticket) {
   const planned = Number(getPlannedEffortHours(ticket));
   const hasManualPlan = hasManualPlannedEffort(ticket);
+  const workedEffort = getWorkedEffortHours(ticket);
 
   // Derive scheduled effort from existing segments.
   // If planned effort is NOT manually locked by developer, scheduling should follow
@@ -707,6 +710,7 @@ function getTicketEffort(ticket) {
     getAllTicketSegments(ticket).reduce((sum, segment) => sum + segmentDuration(segment), 0)
   );
 
+  if (workedEffort > 0 && Number.isFinite(planned) && planned > 0) return roundHalf(planned);
   if (!hasManualPlan && scheduledEffort > 0) return scheduledEffort;
   if (Number.isFinite(planned) && planned > 0) return roundHalf(planned);
   return scheduledEffort > 0 ? scheduledEffort : 0;
@@ -1021,6 +1025,7 @@ function shouldLockWholeTicket(
   { allowInProgressReplan = false } = {}
 ) {
   if (!ticket) return true;
+  if (ticket.manual_schedule_locked === true) return true;
   if (normalizeTicketStatus(ticket.status) !== "in_progress") return false;
   if (allowInProgressReplan) return false;
 
@@ -2105,11 +2110,22 @@ export function buildWeeklyRebalanceUpdates(
     const isToday = dateStr === todayStr;
 
     if (dayOfWeek <= 5) {
-      const slots = buildFreeSlotsForDay(dateStr, lockedIntervalsByDate[dateStr] || [], {
+      let slots = buildFreeSlotsForDay(dateStr, lockedIntervalsByDate[dateStr] || [], {
         isToday,
         includeTodayHoles,
         nowDecimal,
       });
+
+      if (hasManualInsertionAnchor) {
+        if (dateStr < anchorDate) {
+          slots = [];
+        } else if (dateStr === anchorDate) {
+          slots = slots
+            .map((slot) => ({ ...slot, start: Math.max(slot.start, anchorStart) }))
+            .filter((slot) => slot.end > slot.start);
+        }
+      }
+
       freeSlots.push(...slots);
     }
 
@@ -2283,7 +2299,9 @@ export function buildVisibleWeekCompactionUpdates(
 
   devTickets.forEach((ticket) => {
     const segments = getAllTicketSegments(ticket);
-    const lockWholeInWeek = normalizeTicketStatus(ticket.status) === "in_progress";
+    const lockWholeInWeek =
+      normalizeTicketStatus(ticket.status) === "in_progress" ||
+      ticket.manual_schedule_locked === true;
 
     segments.forEach((segment) => {
       const segmentMoment = moment(segment.date, "YYYY-MM-DD", true);
@@ -2930,12 +2948,17 @@ export default function DevPipeline() {
     }
   };
 
-  const openResumePausedTicketDialog = (ticket) => {
+  const openResumePausedTicketDialog = (ticket, activeTicket = null) => {
     if (!ticket?.id) return;
     const workedEffort = roundHalf(getWorkedEffortHours(ticket));
     const remainingEffort = roundHalf(getRemainingEffortHours(ticket));
     setResumePausedRemainingInput(String(remainingEffort > 0 ? remainingEffort : 0.5));
-    setResumePausedTicketDialog({ ticket, workedEffort, remainingEffort });
+    setResumePausedTicketDialog({
+      ticket,
+      workedEffort,
+      remainingEffort,
+      activeTicket: activeTicket || findConcurrentInProgressTicket(ticket),
+    });
   };
 
   const resumePausedTicket = async (ticket, remainingEffortHours) => {
@@ -2974,8 +2997,85 @@ export default function DevPipeline() {
     const latestTickets = await appClient.entities.Ticket.list();
     const activeInProgressTicket = findConcurrentInProgressTicket(ticket, latestTickets);
     if (activeInProgressTicket) {
-      openInProgressBlockDialog(ticket, activeInProgressTicket);
-      return false;
+      const ticketClient = getTicketClient(ticket);
+      const nextRemainingEffort = Number(normalizedRemainingEffort || effortToPlan);
+      const nextPlannedEffort = roundHalf(workedEffort + nextRemainingEffort);
+      const workedSchedule = schedulePayloadFromSegments(getWorkedTicketSegments(ticket));
+      const activeSegments = sortSegments(getAllTicketSegments(activeInProgressTicket));
+      const activeAnchorSegment = [...activeSegments]
+        .filter(
+          (segment) =>
+            segment.date > startDate ||
+            (segment.date === startDate && segment.end > (nowInfo.decimal ?? DAY_START))
+        )
+        .pop() || null;
+      const anchorDate = activeAnchorSegment?.date || startDate;
+      const anchorStart = activeAnchorSegment?.end || (nowInfo.roundedDecimal ?? DAY_START);
+      const clearMissingDataOnReactivation = ticket?.missing_required_data === true;
+      const auditEntry = {
+        timestamp: new Date().toISOString(),
+        user: user?.email || user?.full_name || "user",
+        action: "ticket_requeued_after_pause",
+        details: `Ticket requeued after ${activeInProgressTicket.title} with ${nextRemainingEffort}h remaining`,
+      };
+
+      await appClient.entities.Ticket.update(ticket.id, {
+        status: "new",
+        ...workedSchedule,
+        ...(clearMissingDataOnReactivation
+          ? {
+              missing_required_data: false,
+              missing_required_data_reported_at: null,
+              missing_required_data_reported_by: null,
+              missing_required_data_reported_by_id: null,
+              priority_override: null,
+            }
+          : {}),
+        proposed_effort: nextPlannedEffort,
+        remaining_effort_hours: nextRemainingEffort,
+        planned_effort_locked: true,
+        resumed_at: new Date().toISOString(),
+        resumed_by: user?.email || user?.full_name || "user",
+        resumed_by_id: user?.id || null,
+        manual_schedule_locked: false,
+        manual_schedule_locked_at: null,
+        priority_score: calculatePriorityScore(
+          {
+            ...ticket,
+            status: "new",
+            missing_required_data: false,
+            priority_override: null,
+            proposed_effort: nextPlannedEffort,
+          },
+          ticketClient,
+          config
+        ),
+        audit_log: [...(ticket.audit_log || []), auditEntry],
+      });
+
+      await applyDeveloperRebalance(ticket.assignee_id, dev, {
+        freezeTicketIds: [activeInProgressTicket.id],
+        preserveWorkingDaysFromToday: 0,
+        preserveExistingSequence: false,
+        includeTodayHoles: true,
+        freezeCurrentWeekSegments: false,
+        preserveTodaySegments: false,
+        preserveElapsedTodaySegments: true,
+        allowInProgressReplan: true,
+        forceFirstTicketIds: [ticket.id],
+        planningStartDate: anchorDate,
+        manualInsertionAnchor: {
+          date: anchorDate,
+          start: anchorStart,
+        },
+      });
+
+      await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+      toast({
+        title: "Ticket reinserito in pipe",
+        description: `${ticket.title} rimane New e partira dopo ${activeInProgressTicket.title}.`,
+      });
+      return true;
     }
 
     const selectedStartDecimal = timeToDecimal(startTime);
@@ -3081,6 +3181,8 @@ export default function DevPipeline() {
       resumed_at: new Date().toISOString(),
       resumed_by: user?.email || user?.full_name || "user",
       resumed_by_id: user?.id || null,
+      manual_schedule_locked: false,
+      manual_schedule_locked_at: null,
       priority_score: calculatePriorityScore(nextTicketForPriority, ticketClient, config),
       audit_log: [...(ticket.audit_log || []), auditEntry],
     });
@@ -3584,6 +3686,8 @@ export default function DevPipeline() {
           resumed_at: new Date().toISOString(),
           resumed_by: user?.email || user?.full_name || "user",
           resumed_by_id: user?.id || null,
+          manual_schedule_locked: false,
+          manual_schedule_locked_at: null,
           priority_score: calculatePriorityScore(
             {
               ...ticket,
@@ -3616,6 +3720,8 @@ export default function DevPipeline() {
           paused_by: user?.email || user?.full_name || "user",
           paused_by_id: user?.id || null,
           paused_from_status: previousStatus,
+          manual_schedule_locked: false,
+          manual_schedule_locked_at: null,
         });
       } else {
         Object.assign(timeData, {
@@ -3849,21 +3955,22 @@ export default function DevPipeline() {
       return;
     }
 
+    if (
+      normalizedNewStatus === "in_progress" &&
+      ["blocked", "new"].includes(previousStatus) &&
+      getWorkedEffortHours(latestTicket) > 0
+    ) {
+      const activeInProgressTicket = findConcurrentInProgressTicket(latestTicket);
+      openResumePausedTicketDialog(latestTicket, activeInProgressTicket);
+      return;
+    }
+
     if (normalizedNewStatus === "in_progress") {
       const activeInProgressTicket = findConcurrentInProgressTicket(latestTicket);
       if (activeInProgressTicket) {
         openInProgressBlockDialog(latestTicket, activeInProgressTicket);
         return;
       }
-    }
-
-    if (
-      normalizedNewStatus === "in_progress" &&
-      ["blocked", "new"].includes(previousStatus) &&
-      getWorkedEffortHours(latestTicket) > 0
-    ) {
-      openResumePausedTicketDialog(latestTicket);
-      return;
     }
 
     if (normalizedNewStatus === "in_progress" && latestTicket.start_time) {
@@ -4075,9 +4182,13 @@ export default function DevPipeline() {
                 <Clock className="h-5 w-5 text-violet-600 dark:text-violet-300" />
               </div>
               <div className="min-w-0">
-                <h3 className="text-sm font-semibold text-foreground">Riprendi ticket in pausa</h3>
+                <h3 className="text-sm font-semibold text-foreground">
+                  {resumePausedTicketDialog.activeTicket ? "Reinserisci ticket in pipe" : "Riprendi ticket in pausa"}
+                </h3>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  Le {resumePausedTicketDialog.workedEffort}h gia lavorate restano bloccate nel calendario. Verra pianificato solo l&apos;effort residuo.
+                  {resumePausedTicketDialog.activeTicket
+                    ? `${resumePausedTicketDialog.activeTicket.title} e gia in progress. Il ticket sospeso tornera New subito sotto l'attivita corrente.`
+                    : `Le ${resumePausedTicketDialog.workedEffort}h gia lavorate restano bloccate nel calendario. Verra pianificato solo l'effort residuo.`}
                 </p>
               </div>
             </div>
@@ -4123,7 +4234,7 @@ export default function DevPipeline() {
                 onClick={handleResumePausedTicketConfirm}
               >
                 {resumingPausedTicketId ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : null}
-                Riprendi e ripianifica
+                {resumePausedTicketDialog.activeTicket ? "Rimetti in pipe come New" : "Riprendi e ripianifica"}
               </Button>
             </div>
           </div>

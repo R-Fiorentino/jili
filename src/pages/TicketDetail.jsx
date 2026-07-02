@@ -660,6 +660,31 @@ function normalizeTicketKind(ticket) {
   return normalized || "main";
 }
 
+function isTicketAssignedToClientTechSupervisor(ticket, client) {
+  if (!ticket || !client) return false;
+
+  const assigneeId = String(ticket.assignee_id || "").trim();
+  const supervisorId = String(client.tech_supervisor_id || "").trim();
+  if (assigneeId && supervisorId && assigneeId === supervisorId) return true;
+
+  const assigneeEmail = normalizeText(ticket.assignee_email);
+  const assigneeName = normalizeText(ticket.assignee_name);
+  const supervisorEmail = normalizeText(client.tech_supervisor_email);
+  const supervisorName = normalizeText(client.tech_supervisor_name);
+
+  return Boolean(
+    (assigneeEmail && supervisorEmail && assigneeEmail === supervisorEmail) ||
+    (assigneeName && supervisorName && assigneeName === supervisorName)
+  );
+}
+
+function canTicketMoveDirectlyFromNewToDone(ticket, client) {
+  return (
+    normalizeTicketKind(ticket) === "live_ops" ||
+    isTicketAssignedToClientTechSupervisor(ticket, client)
+  );
+}
+
 function normalizeLiveOperationType(value) {
   const normalized = String(value || "").trim().toLowerCase();
   return Object.prototype.hasOwnProperty.call(LIVE_OPERATION_LABELS, normalized)
@@ -928,6 +953,7 @@ export default function TicketDetail() {
   const [qaRejectDialog, setQaRejectDialog] = useState(false);
   const [qaRejectNotes, setQaRejectNotes] = useState("");
   const [submittingQaDecision, setSubmittingQaDecision] = useState(false);
+  const [submittingQaFixReview, setSubmittingQaFixReview] = useState(false);
   const [postPreviewDialog, setPostPreviewDialog] = useState(false);
   const [postPreviewNotes, setPostPreviewNotes] = useState("");
   const [postPreviewEffortInput, setPostPreviewEffortInput] = useState(String(POST_PREVIEW_CHANGE_EFFORT_HOURS));
@@ -1261,6 +1287,7 @@ export default function TicketDetail() {
     developer,
     ticketId: targetTicketId,
     insertBeforeNextActivity = false,
+    anchorAfterTicketId = null,
   }) => {
     if (!developer?.id || !targetTicketId) return null;
 
@@ -1269,7 +1296,10 @@ export default function TicketDetail() {
       (entry) => entry.assignee_id === developer.id && isSchedulableTicket(entry)
     );
     const nowInfo = getNowInRome();
-    const currentOccupiedTicket = sourceDeveloperTickets.find((entry) => {
+    const preferredAnchorTicket = anchorAfterTicketId
+      ? sourceDeveloperTickets.find((entry) => entry.id === anchorAfterTicketId) || null
+      : null;
+    const liveOccupiedTicket = sourceDeveloperTickets.find((entry) => {
       if (entry.id === targetTicketId) return false;
       return getTicketScheduleSegments(entry).some(
         (segment) =>
@@ -1279,14 +1309,26 @@ export default function TicketDetail() {
           segment.end > nowInfo.decimal
       );
     });
+    const currentOccupiedTicket = preferredAnchorTicket || liveOccupiedTicket;
+    const currentTicketSegments = currentOccupiedTicket
+      ? getTicketScheduleSegments(currentOccupiedTicket)
+      : [];
     const currentOccupiedSegment = currentOccupiedTicket
-      ? getTicketScheduleSegments(currentOccupiedTicket).find(
-          (segment) =>
-            segment.date === nowInfo.date &&
-            nowInfo.decimal != null &&
-            segment.start <= nowInfo.decimal &&
-            segment.end > nowInfo.decimal
-        ) || null
+      ? (preferredAnchorTicket
+          ? [...currentTicketSegments]
+              .filter(
+                (segment) =>
+                  segment.date > nowInfo.date ||
+                  (segment.date === nowInfo.date && segment.end > (nowInfo.decimal ?? DAY_START))
+              )
+              .pop() || null
+          : currentTicketSegments.find(
+              (segment) =>
+                segment.date === nowInfo.date &&
+                nowInfo.decimal != null &&
+                segment.start <= nowInfo.decimal &&
+                segment.end > nowInfo.decimal
+            ) || null)
       : null;
 
     const manualAnchorStart = currentOccupiedSegment
@@ -1722,13 +1764,14 @@ export default function TicketDetail() {
 
     const nextQaCycle = Math.max(getQaCycleValue(sourceTicket), getQaCycleValue(parentTicket), 1) + 1;
 
-    await finalizeStatusChange("done", {
+    await finalizeStatusChange("qa_review", {
       ...statusOptions,
       extraData: {
         qa_cycle: getQaCycleValue(sourceTicket) || 1,
       },
       auditAction: "qa_fix_completed",
-      auditDetails: "QA fix completato; creata una nuova review",
+      auditDetails: "QA fix completato e rimandato in QA; creata una nuova review",
+      suppressCompletionNotification: true,
     });
 
     const latestTickets = await appClient.entities.Ticket.list();
@@ -1776,6 +1819,32 @@ export default function TicketDetail() {
       title: "Fix completato",
       description: "E stata creata una nuova review per il tech supervisor.",
     });
+  };
+
+  const handleResubmitQaFix = async () => {
+    if (!isQaFixTicket || isTicketClosed(ticket)) return;
+
+    setSubmittingQaFixReview(true);
+    try {
+      const conflict = getCompletionConflictData("qa_review");
+      if (conflict) {
+        setDoneConflict({
+          ...conflict,
+          qaFixReopenReview: true,
+        });
+        return;
+      }
+
+      await completeQaFixAndRestartReview();
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Invio in QA non riuscito",
+        description: error?.message || "Riprova tra qualche secondo.",
+      });
+    } finally {
+      setSubmittingQaFixReview(false);
+    }
   };
 
   const getOpenLiveOpsTicketByType = async ({ parentTicketId, operationType }) => {
@@ -2206,6 +2275,8 @@ export default function TicketDetail() {
         start_time: null,
         end_time: null,
         continuation_schedule: [],
+        manual_schedule_locked: false,
+        manual_schedule_locked_at: null,
       });
 
       if (preservedEffort > 0 && plannedEffort <= 0) {
@@ -2622,10 +2693,13 @@ export default function TicketDetail() {
       auditAction = "status_change",
       auditDetails = "",
       remainingEffortHours = null,
+      queueAfterTicketId = null,
     } = options;
 
     const normalizedNewStatus = normalizeTicketStatus(newStatus);
-    if (!canTransitionTicketStatus(getTicketWorkflowStatus(ticket), normalizedNewStatus)) {
+    if (!canTransitionTicketStatus(getTicketWorkflowStatus(ticket), normalizedNewStatus, {
+      allowNewToDone: canTicketMoveDirectlyFromNewToDone(ticket, client),
+    })) {
       toast({
         variant: "destructive",
         title: "Cambio stato non consentito",
@@ -2745,6 +2819,8 @@ export default function TicketDetail() {
           resumed_at: new Date().toISOString(),
           resumed_by: user?.email || user?.full_name || "user",
           resumed_by_id: user?.id || null,
+          manual_schedule_locked: false,
+          manual_schedule_locked_at: null,
           priority_score: calculatePriorityScore(
             {
               ...ticket,
@@ -2811,6 +2887,8 @@ export default function TicketDetail() {
           paused_by: user?.email || user?.full_name || "user",
           paused_by_id: user?.id || null,
           paused_from_status: previousStatus,
+          manual_schedule_locked: false,
+          manual_schedule_locked_at: null,
         });
       } else {
         timeData.scheduled_date = null;
@@ -2882,6 +2960,21 @@ export default function TicketDetail() {
         `Status: ${normalizeTicketStatus(ticket.status)} → ${newStatus}${auditStartTime ? ` (start: ${auditStartTime})` : ""}${auditEndTime ? ` (end: ${auditEndTime})` : ""}`,
     });
 
+    if (newStatus === "new" && queueAfterTicketId && ticket.assignee_id) {
+      const requeueDeveloper = resolveTicketAssigneeDeveloper(ticket);
+      if (requeueDeveloper) {
+        await schedulePriorityInsertionBeforeNew({
+          developer: requeueDeveloper,
+          ticketId: ticket.id,
+          insertBeforeNextActivity: true,
+          anchorAfterTicketId: queueAfterTicketId,
+        });
+        await queryClient.invalidateQueries({ queryKey: ["ticket", ticketId] });
+        await queryClient.invalidateQueries({ queryKey: ["tickets"] });
+        return true;
+      }
+    }
+
     if (isReactivatingFromBlocked && ticket.assignee_id) {
       if (newStatus === "in_progress") {
         const anchorStart = timeToDecimal(timeData.start_time);
@@ -2912,6 +3005,7 @@ export default function TicketDetail() {
           developer: reactivationDeveloper,
           ticketId: ticket.id,
           insertBeforeNextActivity: true,
+          anchorAfterTicketId: queueAfterTicketId,
         });
         await queryClient.invalidateQueries({ queryKey: ["ticket", ticketId] });
         await queryClient.invalidateQueries({ queryKey: ["tickets"] });
@@ -3025,11 +3119,30 @@ export default function TicketDetail() {
 
   const handleStatusChange = async (newStatus) => {
     const normalizedNewStatus = normalizeTicketStatus(newStatus);
-    if (!canTransitionTicketStatus(normalizedStatus, normalizedNewStatus)) {
+    if (!canTransitionTicketStatus(normalizedStatus, normalizedNewStatus, {
+      allowNewToDone: canTicketMoveDirectlyFromNewToDone(ticket, client),
+    })) {
       toast({
         variant: "destructive",
         title: "Cambio stato non consentito",
         description: NEW_TICKET_STATUS_TRANSITION_MESSAGE,
+      });
+      return;
+    }
+
+    if (
+      normalizedNewStatus === "in_progress" &&
+      ["blocked", "new"].includes(normalizeTicketStatus(ticket.status)) &&
+      getWorkedEffortHours(ticket) > 0
+    ) {
+      const activeInProgressTicket = findConcurrentInProgressTicket(ticket);
+      const workedEffort = getWorkedEffortHours(ticket);
+      const remainingEffort = getRemainingEffortHours(ticket);
+      setResumeRemainingInput(String(remainingEffort > 0 ? remainingEffort : 0.5));
+      setResumePauseDialog({
+        workedEffort,
+        remainingEffort,
+        activeTicket: activeInProgressTicket || null,
       });
       return;
     }
@@ -3070,18 +3183,6 @@ export default function TicketDetail() {
       return;
     }
 
-    if (
-      normalizedNewStatus === "in_progress" &&
-      ["blocked", "new"].includes(normalizeTicketStatus(ticket.status)) &&
-      getWorkedEffortHours(ticket) > 0
-    ) {
-      const workedEffort = getWorkedEffortHours(ticket);
-      const remainingEffort = getRemainingEffortHours(ticket);
-      setResumeRemainingInput(String(remainingEffort > 0 ? remainingEffort : 0.5));
-      setResumePauseDialog({ workedEffort, remainingEffort });
-      return;
-    }
-
     // When moving to in_progress, check if current time differs from planned start_time
     if (normalizedNewStatus === "in_progress" && ticket.start_time) {
       const nowTime = getNowInRome().time;
@@ -3092,26 +3193,20 @@ export default function TicketDetail() {
       }
     }
 
+    if (
+      ticketKind === "qa_fix" &&
+      ["qa_review", "done"].includes(normalizedNewStatus)
+    ) {
+      await handleResubmitQaFix();
+      return;
+    }
+
     if (isClosedStatus(normalizedNewStatus) && !isTicketClosed(ticket)) {
       const conflict = getCompletionConflictData(normalizedNewStatus);
       if (conflict) {
         setDoneConflict(conflict);
         return;
       }
-    }
-
-    if (ticketKind === "qa_fix" && normalizedNewStatus === "done") {
-      const conflict = getCompletionConflictData("done");
-      if (conflict) {
-        setDoneConflict({
-          ...conflict,
-          qaFixReopenReview: true,
-        });
-        return;
-      }
-
-      await completeQaFixAndRestartReview();
-      return;
     }
 
     if (ticketKind === "post_preview_change" && normalizedNewStatus === "done") {
@@ -3757,6 +3852,10 @@ export default function TicketDetail() {
   const canManageLiveOps = isLiveOpsTicket && (isAdmin || isCurrentAssignee);
   const canResolveQaReview =
     isQaReviewTicket && (isAdmin || isClientTechSupervisor);
+  const canResubmitQaFix =
+    isQaFixTicket &&
+    normalizeTicketStatus(ticket.status) === "in_progress" &&
+    (isAdmin || isAssignedDeveloper);
   const canEditTimes = !isQaReviewTicket && (
     isAdmin ||
     (!isLiveOpsTicket && (isAnalyst || canManageAsTechSupervisor || isAssignedDeveloper))
@@ -3975,12 +4074,18 @@ export default function TicketDetail() {
     users.find((candidate) => (candidate.id || candidate.email) === watcherToAddId) || null;
   const hiddenReportedStatus = ([key]) => key !== "reported" || normalizedStatus === "reported";
   const allowedStatusEntry = ([key]) =>
-    hiddenReportedStatus([key]) && canTransitionTicketStatus(normalizedStatus, key);
-  const availableStatusEntries = isQaFixTicket || isLiveOpsTicket || isPostPreviewChangeTicket
+    hiddenReportedStatus([key]) && canTransitionTicketStatus(normalizedStatus, key, {
+      allowNewToDone: canTicketMoveDirectlyFromNewToDone(ticket, client),
+    });
+  const availableStatusEntries = isQaFixTicket
     ? Object.entries(STATUS_CONFIG).filter(
-        ([key]) => allowedStatusEntry([key]) && ["new", "in_progress", "done"].includes(key)
+        ([key]) => allowedStatusEntry([key]) && ["new", "in_progress", "qa_review"].includes(key)
       )
-    : Object.entries(STATUS_CONFIG).filter(allowedStatusEntry);
+    : isLiveOpsTicket || isPostPreviewChangeTicket
+      ? Object.entries(STATUS_CONFIG).filter(
+          ([key]) => allowedStatusEntry([key]) && ["new", "in_progress", "done"].includes(key)
+        )
+      : Object.entries(STATUS_CONFIG).filter(allowedStatusEntry);
   const currentLiveState = normalizeLiveState(ticket?.live_state);
   const liveStateLabel = LIVE_STATE_LABELS[currentLiveState] || LIVE_STATE_LABELS.not_live;
   const liveOperationType = normalizeLiveOperationType(ticket?.live_operation_type);
@@ -4579,9 +4684,13 @@ export default function TicketDetail() {
                 <Clock className="h-5 w-5 text-violet-600 dark:text-violet-300" />
               </div>
               <div>
-                <h3 className="text-sm font-semibold text-foreground">Riprendi ticket in pausa</h3>
+                <h3 className="text-sm font-semibold text-foreground">
+                  {resumePauseDialog.activeTicket ? "Reinserisci ticket in pipe" : "Riprendi ticket in pausa"}
+                </h3>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  Le {resumePauseDialog.workedEffort}h gia lavorate restano bloccate nel calendario. Verra pianificato solo l&apos;effort residuo.
+                  {resumePauseDialog.activeTicket
+                    ? `${resumePauseDialog.activeTicket.title} e gia in progress. Questo ticket tornera New subito dopo l'attivita corrente e verra pianificato solo l'effort residuo.`
+                    : `Le ${resumePauseDialog.workedEffort}h gia lavorate restano bloccate nel calendario. Verra pianificato solo l'effort residuo.`}
                 </p>
               </div>
             </div>
@@ -4625,16 +4734,55 @@ export default function TicketDetail() {
                   const nextRemaining = normalizeEffortHours(resumeRemainingInput);
                   if (!nextRemaining) return;
                   const nowInfo = getNowInRome();
+                  const dialogState = resumePauseDialog;
                   setResumePauseDialog(null);
+
+                  if (dialogState.activeTicket) {
+                    const nextPlannedEffort = roundHalf(dialogState.workedEffort + nextRemaining);
+                    const nextStatus = "new";
+                    await finalizeStatusChange(nextStatus, {
+                      remainingEffortHours: nextRemaining,
+                      queueAfterTicketId: dialogState.activeTicket.id,
+                      extraData: {
+                        proposed_effort: nextPlannedEffort,
+                        remaining_effort_hours: nextRemaining,
+                        planned_effort_locked: true,
+                        resumed_at: new Date().toISOString(),
+                        resumed_by: user?.email || user?.full_name || "user",
+                        resumed_by_id: user?.id || null,
+                        manual_schedule_locked: false,
+                        manual_schedule_locked_at: null,
+                        priority_score: calculatePriorityScore(
+                          {
+                            ...ticket,
+                            status: nextStatus,
+                            missing_required_data: false,
+                            priority_override: null,
+                            proposed_effort: nextPlannedEffort,
+                          },
+                          client,
+                          config
+                        ),
+                      },
+                      auditAction: "ticket_requeued_after_pause",
+                      auditDetails: `Ticket requeued after ${dialogState.activeTicket.title} with ${nextRemaining}h remaining`,
+                    });
+                    toast({
+                      title: "Ticket reinserito in pipe",
+                      description: `Rimane New e partira dopo ${dialogState.activeTicket.title}.`,
+                    });
+                    return;
+                  }
+
                   await finalizeStatusChange("in_progress", {
                     overrideStartTime: nowInfo.roundedTime || nowInfo.time,
                     remainingEffortHours: nextRemaining,
                     auditAction: "ticket_resumed",
-                    auditDetails: `Ticket resumed with ${nextRemaining}h remaining after ${resumePauseDialog.workedEffort}h worked`,
+                    auditDetails: `Ticket resumed with ${nextRemaining}h remaining after ${dialogState.workedEffort}h worked`,
                   });
                 }}
               >
-                Riprendi e ripianifica
+                {resumePauseDialog.activeTicket ? "Rimetti in pipe come New" : "Riprendi e ripianifica"}
               </Button>
             </div>
           </div>
@@ -6338,12 +6486,32 @@ export default function TicketDetail() {
             </CardHeader>
             <CardContent className="space-y-5">
               {(canResolveQaReview ||
+                canResubmitQaFix ||
                 canRequestPostPreviewChange ||
                 canRequestLiveOps ||
                 (isLiveOpsTicket && canManageLiveOps && !isTicketClosed(ticket)) ||
                 canManageUrgency) && (
                 <div className="space-y-3 rounded-2xl border border-border/60 bg-muted/10 p-3">
                   <p className={sectionEyebrowClass}>Azioni operative</p>
+              {canResubmitQaFix && (
+                <div className="rounded-2xl border border-cyan-200 bg-cyan-50/90 p-4 dark:border-cyan-500/30 dark:bg-cyan-500/10">
+                  <p className="text-xs font-semibold uppercase tracking-[0.24em] text-cyan-700 dark:text-cyan-300">
+                    QA fix completato
+                  </p>
+                  <p className="mt-2 text-sm text-cyan-800 dark:text-cyan-100">
+                    Rimanda la preview al tech supervisor per un nuovo controllo. La task di fix verra chiusa e verra creato un nuovo giro QA.
+                  </p>
+                  <Button
+                    type="button"
+                    className="mt-4 h-9 w-full rounded-xl bg-cyan-600 text-white hover:bg-cyan-700"
+                    onClick={handleResubmitQaFix}
+                    disabled={submittingQaFixReview || updateMutation.isPending}
+                  >
+                    {submittingQaFixReview ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                    Rimanda in QA
+                  </Button>
+                </div>
+              )}
               {canResolveQaReview && (
                 <div className="rounded-2xl border border-cyan-200 bg-cyan-50/90 p-4 dark:border-cyan-500/30 dark:bg-cyan-500/10">
                   <p className="text-xs font-semibold uppercase tracking-[0.24em] text-cyan-700 dark:text-cyan-300">

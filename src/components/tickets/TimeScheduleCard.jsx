@@ -401,6 +401,8 @@ export default function TimeScheduleCard({ ticket, canEdit, onUpdate }) {
       start_time: editStart,
       end_time: firstDayEnd,
       continuation_schedule: continuationSchedule,
+      manual_schedule_locked: true,
+      manual_schedule_locked_at: new Date().toISOString(),
     };
 
    await appClient.entities.Ticket.update(ticket.id, updates);

@@ -338,13 +338,20 @@ export function getTicketWorkflowStatus(ticket) {
   return hasTicketReportedOutcome(ticket) || hasTicketReportContent(ticket) ? "reported" : normalized;
 }
 
-export function canTransitionTicketStatus(currentStatus, nextStatus) {
+export function canTransitionTicketStatus(
+  currentStatus,
+  nextStatus,
+  { allowNewToDone = false } = {}
+) {
   const normalizedCurrent = normalizeTicketStatus(currentStatus);
   const normalizedNext = normalizeTicketStatus(nextStatus);
 
   if (normalizedCurrent === normalizedNext) return true;
   if (normalizedCurrent === "new") {
-    return NEW_TICKET_ALLOWED_NEXT_STATUSES.includes(normalizedNext);
+    return (
+      NEW_TICKET_ALLOWED_NEXT_STATUSES.includes(normalizedNext) ||
+      (allowNewToDone && normalizedNext === "done")
+    );
   }
 
   return true;
