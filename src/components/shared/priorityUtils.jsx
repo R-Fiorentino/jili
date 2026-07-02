@@ -316,6 +316,10 @@ export const STATUS_CONFIG = {
 };
 
 export const PIPELINE_ORDER = ["new", "in_progress", "qa_review", "done", "blocked"];
+export const NEW_TICKET_ALLOWED_NEXT_STATUSES = ["in_progress", "blocked"];
+export const NEW_TICKET_STATUS_TRANSITION_MESSAGE =
+  "Un ticket New puo passare solo a In Progress o In pausa.";
+
 const LEGACY_STATUS_MAP = {
   needs_effort: "new",
   ready: "new",
@@ -332,6 +336,18 @@ export function getTicketWorkflowStatus(ticket) {
   const normalized = normalizeTicketStatus(ticket?.status);
   if (normalized === "reported") return "reported";
   return hasTicketReportedOutcome(ticket) || hasTicketReportContent(ticket) ? "reported" : normalized;
+}
+
+export function canTransitionTicketStatus(currentStatus, nextStatus) {
+  const normalizedCurrent = normalizeTicketStatus(currentStatus);
+  const normalizedNext = normalizeTicketStatus(nextStatus);
+
+  if (normalizedCurrent === normalizedNext) return true;
+  if (normalizedCurrent === "new") {
+    return NEW_TICKET_ALLOWED_NEXT_STATUSES.includes(normalizedNext);
+  }
+
+  return true;
 }
 
 export function isClosedStatus(status) {

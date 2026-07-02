@@ -14,9 +14,11 @@ import { Link, useLocation } from "react-router-dom";
 import { createPageUrl, getHomePageForRole, normalizeAppRole } from "@/utils";
 import { toast } from "@/components/ui/use-toast";
 import {
+  NEW_TICKET_STATUS_TRANSITION_MESSAGE,
   STATUS_CONFIG,
   DIFFICULTY_CONFIG,
   TYPE_CONFIG,
+  canTransitionTicketStatus,
   getPriorityLevel,
   suggestAssignment,
   calculatePriorityScore,
@@ -2622,6 +2624,16 @@ export default function TicketDetail() {
       remainingEffortHours = null,
     } = options;
 
+    const normalizedNewStatus = normalizeTicketStatus(newStatus);
+    if (!canTransitionTicketStatus(getTicketWorkflowStatus(ticket), normalizedNewStatus)) {
+      toast({
+        variant: "destructive",
+        title: "Cambio stato non consentito",
+        description: NEW_TICKET_STATUS_TRANSITION_MESSAGE,
+      });
+      return false;
+    }
+
     const nowInfo = getNowInRome();
     const nowTime = nowInfo.time;
     const previousStatus = normalizeTicketStatus(ticket.status);
@@ -3012,7 +3024,17 @@ export default function TicketDetail() {
   };
 
   const handleStatusChange = async (newStatus) => {
-    if (newStatus === "in_progress") {
+    const normalizedNewStatus = normalizeTicketStatus(newStatus);
+    if (!canTransitionTicketStatus(normalizedStatus, normalizedNewStatus)) {
+      toast({
+        variant: "destructive",
+        title: "Cambio stato non consentito",
+        description: NEW_TICKET_STATUS_TRANSITION_MESSAGE,
+      });
+      return;
+    }
+
+    if (normalizedNewStatus === "in_progress") {
       const activeInProgressTicket = findConcurrentInProgressTicket(ticket);
       if (activeInProgressTicket) {
         openInProgressBlockDialog(ticket, activeInProgressTicket);
@@ -3020,7 +3042,7 @@ export default function TicketDetail() {
       }
     }
 
-    if (newStatus === "qa_review" && ticketKind === "main") {
+    if (normalizedNewStatus === "qa_review" && ticketKind === "main") {
       const existingPreviewLinks = resolveQaPreviewEntries(ticket);
       setQaRequestForm({
         preview_links:
@@ -3034,7 +3056,7 @@ export default function TicketDetail() {
       return;
     }
 
-    if (ticketKind === "live_ops" && newStatus === "done") {
+    if (ticketKind === "live_ops" && normalizedNewStatus === "done") {
       const conflict = getCompletionConflictData("done");
       if (conflict) {
         setDoneConflict({
@@ -3049,7 +3071,7 @@ export default function TicketDetail() {
     }
 
     if (
-      newStatus === "in_progress" &&
+      normalizedNewStatus === "in_progress" &&
       ["blocked", "new"].includes(normalizeTicketStatus(ticket.status)) &&
       getWorkedEffortHours(ticket) > 0
     ) {
@@ -3061,7 +3083,7 @@ export default function TicketDetail() {
     }
 
     // When moving to in_progress, check if current time differs from planned start_time
-    if (newStatus === "in_progress" && ticket.start_time) {
+    if (normalizedNewStatus === "in_progress" && ticket.start_time) {
       const nowTime = getNowInRome().time;
       if (nowTime !== ticket.start_time) {
         // Show conflict dialog
@@ -3070,15 +3092,15 @@ export default function TicketDetail() {
       }
     }
 
-    if (isClosedStatus(newStatus) && !isTicketClosed(ticket)) {
-      const conflict = getCompletionConflictData(newStatus);
+    if (isClosedStatus(normalizedNewStatus) && !isTicketClosed(ticket)) {
+      const conflict = getCompletionConflictData(normalizedNewStatus);
       if (conflict) {
         setDoneConflict(conflict);
         return;
       }
     }
 
-    if (ticketKind === "qa_fix" && newStatus === "done") {
+    if (ticketKind === "qa_fix" && normalizedNewStatus === "done") {
       const conflict = getCompletionConflictData("done");
       if (conflict) {
         setDoneConflict({
@@ -3092,7 +3114,7 @@ export default function TicketDetail() {
       return;
     }
 
-    if (ticketKind === "post_preview_change" && newStatus === "done") {
+    if (ticketKind === "post_preview_change" && normalizedNewStatus === "done") {
       const conflict = getCompletionConflictData("done");
       if (conflict) {
         setDoneConflict({
@@ -3106,7 +3128,7 @@ export default function TicketDetail() {
       return;
     }
 
-    await finalizeStatusChange(newStatus);
+    await finalizeStatusChange(normalizedNewStatus);
   };
 
   const updateQaRequestPreviewLink = (index, field, value) => {
@@ -3952,11 +3974,13 @@ export default function TicketDetail() {
   const selectedWatcherToAdd =
     users.find((candidate) => (candidate.id || candidate.email) === watcherToAddId) || null;
   const hiddenReportedStatus = ([key]) => key !== "reported" || normalizedStatus === "reported";
+  const allowedStatusEntry = ([key]) =>
+    hiddenReportedStatus([key]) && canTransitionTicketStatus(normalizedStatus, key);
   const availableStatusEntries = isQaFixTicket || isLiveOpsTicket || isPostPreviewChangeTicket
     ? Object.entries(STATUS_CONFIG).filter(
-        ([key]) => hiddenReportedStatus([key]) && ["new", "in_progress", "done"].includes(key)
+        ([key]) => allowedStatusEntry([key]) && ["new", "in_progress", "done"].includes(key)
       )
-    : Object.entries(STATUS_CONFIG).filter(hiddenReportedStatus);
+    : Object.entries(STATUS_CONFIG).filter(allowedStatusEntry);
   const currentLiveState = normalizeLiveState(ticket?.live_state);
   const liveStateLabel = LIVE_STATE_LABELS[currentLiveState] || LIVE_STATE_LABELS.not_live;
   const liveOperationType = normalizeLiveOperationType(ticket?.live_operation_type);

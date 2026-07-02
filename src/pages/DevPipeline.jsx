@@ -12,8 +12,10 @@ import { Link, useSearchParams } from "react-router-dom";
 import { createPageUrl, isDeveloperLikeRole } from "@/utils";
 import {
   DEFAULT_CONFIG,
+  NEW_TICKET_STATUS_TRANSITION_MESSAGE,
   STATUS_CONFIG,
   calculatePriorityScore,
+  canTransitionTicketStatus,
   getEffectivePriorityScore,
   getPlannedEffortHours,
   getRemainingEffortHours,
@@ -159,7 +161,10 @@ function PipelineStatusMenu({
   const currentConfig = STATUS_CONFIG[currentStatus] || STATUS_CONFIG.new;
   const triggerLabel = label || currentConfig.label;
   const availableActions = PIPELINE_STATUS_ACTIONS.filter(
-    (option) => option.value !== currentStatus && STATUS_CONFIG[option.value]
+    (option) =>
+      option.value !== currentStatus &&
+      STATUS_CONFIG[option.value] &&
+      canTransitionTicketStatus(currentStatus, option.value)
   );
 
   return (
@@ -3421,6 +3426,14 @@ export default function DevPipeline() {
     const normalizedNewStatus = normalizeTicketStatus(newStatus);
     const previousStatus = normalizeTicketStatus(ticket.status);
     if (previousStatus === normalizedNewStatus) return false;
+    if (!canTransitionTicketStatus(getTicketWorkflowStatus(ticket), normalizedNewStatus)) {
+      toast({
+        variant: "destructive",
+        title: "Cambio stato non consentito",
+        description: NEW_TICKET_STATUS_TRANSITION_MESSAGE,
+      });
+      return false;
+    }
 
     const {
       overrideStartDate = null,
@@ -3827,6 +3840,14 @@ export default function DevPipeline() {
     const normalizedNewStatus = normalizeTicketStatus(newStatus);
     const previousStatus = normalizeTicketStatus(latestTicket.status);
     if (previousStatus === normalizedNewStatus) return;
+    if (!canTransitionTicketStatus(getTicketWorkflowStatus(latestTicket), normalizedNewStatus)) {
+      toast({
+        variant: "destructive",
+        title: "Cambio stato non consentito",
+        description: NEW_TICKET_STATUS_TRANSITION_MESSAGE,
+      });
+      return;
+    }
 
     if (normalizedNewStatus === "in_progress") {
       const activeInProgressTicket = findConcurrentInProgressTicket(latestTicket);

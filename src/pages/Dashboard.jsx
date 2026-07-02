@@ -7,7 +7,9 @@ import { AlertTriangle, LayoutGrid, List, Users, Ticket, Clock, Search, CheckCir
 import { Link } from "react-router-dom";
 import { createPageUrl } from "@/utils";
 import {
+  NEW_TICKET_STATUS_TRANSITION_MESSAGE,
   calculatePriorityScore,
+  canTransitionTicketStatus,
   compareTicketsByPriority,
   getEffectivePriorityScore,
   getPlannedEffortHours,
@@ -297,8 +299,18 @@ export default function Dashboard() {
   };
 
   const handleStatusChange = async (ticketId, newStatus, ticket) => {
+    const normalizedNewStatus = normalizeTicketStatus(newStatus);
+    if (!canTransitionTicketStatus(getTicketWorkflowStatus(ticket), normalizedNewStatus)) {
+      toast({
+        variant: "destructive",
+        title: "Cambio stato non consentito",
+        description: NEW_TICKET_STATUS_TRANSITION_MESSAGE,
+      });
+      return;
+    }
+
     const previousStatus = normalizeTicketStatus(ticket.status);
-    if (newStatus === "in_progress") {
+    if (normalizedNewStatus === "in_progress") {
       const latestTicketsForStatus = await appClient.entities.Ticket.list();
       const activeInProgressTicket = findConcurrentInProgressTicket(ticket, latestTicketsForStatus);
       if (activeInProgressTicket) {
@@ -309,7 +321,7 @@ export default function Dashboard() {
 
     if (
       ["blocked", "new"].includes(previousStatus) &&
-      newStatus === "in_progress" &&
+      normalizedNewStatus === "in_progress" &&
       getWorkedEffortHours(ticket) > 0
     ) {
       toast({
@@ -320,8 +332,8 @@ export default function Dashboard() {
     }
     const isReactivatingFromBlocked =
       previousStatus === "blocked" &&
-      newStatus !== "blocked" &&
-      !isClosedStatus(newStatus);
+      normalizedNewStatus !== "blocked" &&
+      !isClosedStatus(normalizedNewStatus);
     const clearMissingDataOnReactivation =
       isReactivatingFromBlocked && ticket?.missing_required_data === true;
     const ticketClient = clearMissingDataOnReactivation
@@ -341,7 +353,7 @@ export default function Dashboard() {
           priority_score: calculatePriorityScore(
             {
               ...ticket,
-              status: newStatus,
+              status: normalizedNewStatus,
               missing_required_data: false,
               priority_override: null,
             },
@@ -353,17 +365,17 @@ export default function Dashboard() {
       timestamp: new Date().toISOString(),
       user: "system",
       action: "status_change",
-      details: `Status changed from ${previousStatus} to ${newStatus}`,
+      details: `Status changed from ${previousStatus} to ${normalizedNewStatus}`,
     };
 
-    const isCompletion = isClosedStatus(newStatus);
-    const nowInRome = isCompletion || isReactivatingFromBlocked || newStatus === "blocked"
+    const isCompletion = isClosedStatus(normalizedNewStatus);
+    const nowInRome = isCompletion || isReactivatingFromBlocked || normalizedNewStatus === "blocked"
       ? getNowInRome()
       : null;
     const doneSnapshot = isCompletion
       ? buildDoneScheduleSnapshot(ticket, nowInRome?.date, nowInRome?.roundedTime || nowInRome?.time)
       : null;
-    const pauseSnapshot = newStatus === "blocked" && previousStatus === "in_progress"
+    const pauseSnapshot = normalizedNewStatus === "blocked" && previousStatus === "in_progress"
       ? buildDoneScheduleSnapshot(ticket, nowInRome?.date, nowInRome?.roundedTime || nowInRome?.time)
       : null;
     const pauseWorkedEffort = roundHalf(Number(pauseSnapshot?.effort_hours) || 0);
@@ -388,11 +400,11 @@ export default function Dashboard() {
       };
     }
 
-    const inProgressSegments = newStatus === "in_progress" && ticket.assignee_id
-      ? getTicketSegments({ ...ticket, status: newStatus })
+    const inProgressSegments = normalizedNewStatus === "in_progress" && ticket.assignee_id
+      ? getTicketSegments({ ...ticket, status: normalizedNewStatus })
       : [];
 
-    if (newStatus === "in_progress" && ticket.assignee_id) {
+    if (normalizedNewStatus === "in_progress" && ticket.assignee_id) {
       const candidateSegments = inProgressSegments;
       if (candidateSegments.length > 0) {
         const latestTickets = await appClient.entities.Ticket.list();
@@ -427,8 +439,8 @@ export default function Dashboard() {
     }
 
     await appClient.entities.Ticket.update(ticketId, {
-      status: newStatus,
-      ...(newStatus === "blocked" || isReactivatingFromBlocked
+      status: normalizedNewStatus,
+      ...(normalizedNewStatus === "blocked" || isReactivatingFromBlocked
         ? pauseSchedule || (getWorkedEffortHours(ticket) > 0 && isReactivatingFromBlocked
             ? {}
             : {
@@ -456,7 +468,7 @@ export default function Dashboard() {
     if (ticket.assignee_id) {
       const latestTickets = await appClient.entities.Ticket.list();
       const dev = developers.find((d) => d.id === ticket.assignee_id) || null;
-      const rebalanceOptions = newStatus === "blocked"
+      const rebalanceOptions = normalizedNewStatus === "blocked"
         ? getPauseRebalanceOptions(ticket, {
             excludePausedTicket: !pauseSnapshot || pauseWorkedEffort <= 0,
           })
@@ -483,7 +495,7 @@ export default function Dashboard() {
                 start: nowInRome?.roundedDecimal ?? 9,
               },
             })
-        : newStatus === "in_progress"
+        : normalizedNewStatus === "in_progress"
           ? getDynamicRebalanceOptions({
               freezeTicketIds: [ticketId],
               preserveWorkingDaysFromToday: 0,
@@ -521,7 +533,7 @@ export default function Dashboard() {
       appClient.integrations.Core.SendEmail({
         to: ticket.created_by,
         subject: `Ticket completato/review: ${ticket.title}`,
-        body: `Il ticket "${ticket.title}" per ${ticket.client_name || "N/A"} è stato concluso con stato ${newStatus}.`,
+        body: `Il ticket "${ticket.title}" per ${ticket.client_name || "N/A"} è stato concluso con stato ${normalizedNewStatus}.`,
       }).catch(() => {});
     }
 
