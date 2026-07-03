@@ -3187,20 +3187,25 @@ export default function DevPipeline() {
       audit_log: [...(ticket.audit_log || []), auditEntry],
     });
 
-    const anchorStart = timeToDecimal(scheduleUpdates.start_time);
+    const firstActiveSegment = activeScheduleSegments[0] || null;
+    const anchorDate = firstActiveSegment?.date || startDate;
+    const anchorStart = Number.isFinite(firstActiveSegment?.start)
+      ? firstActiveSegment.start
+      : timeToDecimal(startTime);
     await applyDeveloperRebalance(ticket.assignee_id, dev, {
-      freezeTicketIds: [ticket.id],
       preserveWorkingDaysFromToday: 0,
-      preserveExistingSequence: true,
+      preserveExistingSequence: false,
       includeTodayHoles: true,
       freezeCurrentWeekSegments: false,
       preserveTodaySegments: false,
+      preserveElapsedTodaySegments: true,
       allowInProgressReplan: true,
-      planningStartDate: scheduleUpdates.scheduled_date || startDate,
-      ...(Number.isFinite(anchorStart) && scheduleUpdates.scheduled_date
+      forceFirstTicketIds: [ticket.id],
+      planningStartDate: anchorDate,
+      ...(Number.isFinite(anchorStart) && anchorDate
         ? {
             manualInsertionAnchor: {
-              date: scheduleUpdates.scheduled_date,
+              date: anchorDate,
               start: anchorStart,
             },
           }
@@ -3564,6 +3569,8 @@ export default function DevPipeline() {
     let resolvedCompletionDateForRebalance = null;
     let resolvedCompletionTimeForRebalance = null;
     let pauseRebalanceOptions = null;
+    let prioritizeResumedInProgress = false;
+    let resumedInProgressAnchor = null;
 
     if (normalizedNewStatus === "in_progress") {
       if (!ticket.assignee_id) {
@@ -3582,16 +3589,19 @@ export default function DevPipeline() {
         return false;
       }
 
-      const selectedStartTime = overrideStartTime || ticket.start_time || nowTime;
-      const selectedStartDate =
-        overrideStartDate ||
-        (selectedStartTime === nowTime
-          ? nowInfo.date
-          : ticket.scheduled_date || nowInfo.date);
       const workedEffort = roundHalf(getWorkedEffortHours(ticket));
       const normalizedRemainingEffort = normalizeEffortHours(remainingEffortHours);
       const isResumingWorkedTicket =
         workedEffort > 0 && ["blocked", "new"].includes(previousStatus);
+      const defaultStartTime = isResumingWorkedTicket
+        ? nowTime
+        : ticket.start_time || nowTime;
+      const selectedStartTime = overrideStartTime || defaultStartTime;
+      const selectedStartDate =
+        overrideStartDate ||
+        (isResumingWorkedTicket || selectedStartTime === nowTime
+          ? nowInfo.date
+          : ticket.scheduled_date || nowInfo.date);
       const effortToPlan = isResumingWorkedTicket
         ? Number(normalizedRemainingEffort || getRemainingEffortHours(ticket) || 0)
         : Number(getPlannedEffortHours(ticket) || getTicketEffort(ticket) || 0);
@@ -3632,6 +3642,13 @@ export default function DevPipeline() {
       const activeScheduleSegments = splitSchedule
         ? getAllTicketSegments(splitSchedule)
         : [];
+      if (isResumingWorkedTicket) {
+        const firstActiveSegment = activeScheduleSegments[0] || null;
+        prioritizeResumedInProgress = true;
+        resumedInProgressAnchor = firstActiveSegment
+          ? { date: firstActiveSegment.date, start: firstActiveSegment.start }
+          : null;
+      }
 
       if (activeScheduleSegments.length === 0) {
         toast({
@@ -3829,20 +3846,24 @@ export default function DevPipeline() {
 
     if (ticket.assignee_id) {
       if (normalizedNewStatus === "in_progress") {
-        const anchorStart = timeToDecimal(timeData.start_time);
+        const anchorStart = Number.isFinite(resumedInProgressAnchor?.start)
+          ? resumedInProgressAnchor.start
+          : timeToDecimal(timeData.start_time);
+        const anchorDate = resumedInProgressAnchor?.date || timeData.scheduled_date || nowInfo.date;
         await applyDeveloperRebalance(ticket.assignee_id, dev, {
-          freezeTicketIds: [ticket.id],
           preserveWorkingDaysFromToday: 0,
-          preserveExistingSequence: true,
+          preserveExistingSequence: !prioritizeResumedInProgress,
           includeTodayHoles: true,
           freezeCurrentWeekSegments: false,
           preserveTodaySegments: false,
+          preserveElapsedTodaySegments: true,
           allowInProgressReplan: true,
-          planningStartDate: timeData.scheduled_date || nowInfo.date,
-          ...(Number.isFinite(anchorStart) && timeData.scheduled_date
+          ...(prioritizeResumedInProgress ? { forceFirstTicketIds: [ticket.id] } : { freezeTicketIds: [ticket.id] }),
+          planningStartDate: anchorDate,
+          ...(Number.isFinite(anchorStart) && anchorDate
             ? {
                 manualInsertionAnchor: {
-                  date: timeData.scheduled_date,
+                  date: anchorDate,
                   start: anchorStart,
                 },
               }

@@ -2685,6 +2685,7 @@ export default function TicketDetail() {
 
   const doStatusChange = async (newStatus, options = {}) => {
     const {
+      overrideStartDate = null,
       overrideStartTime = null,
       completionMode = "now",
       completionDate = null,
@@ -2741,6 +2742,8 @@ export default function TicketDetail() {
     let resolvedCompletionDateForRebalance = null;
     let resolvedCompletionTimeForRebalance = null;
     let pauseRebalanceOptions = null;
+    let prioritizeResumedInProgress = false;
+    let resumedInProgressAnchor = null;
 
     if (newStatus === "in_progress") {
       const latestTickets = await appClient.entities.Ticket.list();
@@ -2750,16 +2753,21 @@ export default function TicketDetail() {
         return false;
       }
 
-      const selectedStartTime = overrideStartTime || ticket.start_time || nowTime;
-      const movingToNow = selectedStartTime === nowTime;
-      const selectedStartDate = movingToNow
-        ? moment().format("YYYY-MM-DD")
-        : ticket.scheduled_date || moment().format("YYYY-MM-DD");
       const dev = developers.find((d) => d.id === ticket.assignee_id);
       const normalizedRemainingEffort = normalizeEffortHours(remainingEffortHours);
       const workedEffort = getWorkedEffortHours(ticket);
       const isResumingWorkedTicket =
         workedEffort > 0 && ["blocked", "new"].includes(previousStatus);
+      const defaultStartTime = isResumingWorkedTicket
+        ? nowInfo.roundedTime || nowTime
+        : ticket.start_time || nowTime;
+      const selectedStartTime = overrideStartTime || defaultStartTime;
+      const movingToNow = selectedStartTime === nowTime || selectedStartTime === nowInfo.roundedTime;
+      const selectedStartDate =
+        overrideStartDate ||
+        (isResumingWorkedTicket || movingToNow
+          ? nowInfo.date
+          : ticket.scheduled_date || nowInfo.date);
       const effortToPlan = isResumingWorkedTicket
         ? Number(normalizedRemainingEffort || getRemainingEffortHours(ticket) || 0)
         : Number(getPlannedEffortHours(ticket) || 0);
@@ -2790,6 +2798,13 @@ export default function TicketDetail() {
       const activeScheduleSegments = splitSchedule
         ? getTicketScheduleSegments(splitSchedule)
         : [];
+      if (isResumingWorkedTicket) {
+        const firstActiveSegment = activeScheduleSegments[0] || null;
+        prioritizeResumedInProgress = true;
+        resumedInProgressAnchor = firstActiveSegment
+          ? { date: firstActiveSegment.date, start: firstActiveSegment.start }
+          : null;
+      }
 
       if (splitSchedule) {
         if (isResumingWorkedTicket) {
@@ -2977,20 +2992,24 @@ export default function TicketDetail() {
 
     if (isReactivatingFromBlocked && ticket.assignee_id) {
       if (newStatus === "in_progress") {
-        const anchorStart = timeToDecimal(timeData.start_time);
+        const anchorStart = Number.isFinite(resumedInProgressAnchor?.start)
+          ? resumedInProgressAnchor.start
+          : timeToDecimal(timeData.start_time);
+        const anchorDate = resumedInProgressAnchor?.date || timeData.scheduled_date || nowInfo.date;
         await applyRebalanceForDevelopers([ticket.assignee_id], {
-          freezeTicketIds: [ticket.id],
           preserveWorkingDaysFromToday: 0,
-          preserveExistingSequence: true,
+          preserveExistingSequence: !prioritizeResumedInProgress,
           includeTodayHoles: true,
           freezeCurrentWeekSegments: false,
           preserveTodaySegments: false,
+          preserveElapsedTodaySegments: true,
           allowInProgressReplan: true,
-          planningStartDate: timeData.scheduled_date || nowInfo.date,
-          ...(Number.isFinite(anchorStart) && timeData.scheduled_date
+          ...(prioritizeResumedInProgress ? { forceFirstTicketIds: [ticket.id] } : { freezeTicketIds: [ticket.id] }),
+          planningStartDate: anchorDate,
+          ...(Number.isFinite(anchorStart) && anchorDate
             ? {
                 manualInsertionAnchor: {
-                  date: timeData.scheduled_date,
+                  date: anchorDate,
                   start: anchorStart,
                 },
               }
@@ -3031,20 +3050,24 @@ export default function TicketDetail() {
     }
 
     if (newStatus === "in_progress" && ticket.assignee_id) {
-      const anchorStart = timeToDecimal(timeData.start_time);
+      const anchorStart = Number.isFinite(resumedInProgressAnchor?.start)
+        ? resumedInProgressAnchor.start
+        : timeToDecimal(timeData.start_time);
+      const anchorDate = resumedInProgressAnchor?.date || timeData.scheduled_date || nowInfo.date;
       await applyRebalanceForDevelopers([ticket.assignee_id], {
-        freezeTicketIds: [ticket.id],
         preserveWorkingDaysFromToday: 0,
-        preserveExistingSequence: true,
+        preserveExistingSequence: !prioritizeResumedInProgress,
         includeTodayHoles: true,
         freezeCurrentWeekSegments: false,
         preserveTodaySegments: false,
+        preserveElapsedTodaySegments: true,
         allowInProgressReplan: true,
-        planningStartDate: timeData.scheduled_date || nowInfo.date,
-        ...(Number.isFinite(anchorStart) && timeData.scheduled_date
+        ...(prioritizeResumedInProgress ? { forceFirstTicketIds: [ticket.id] } : { freezeTicketIds: [ticket.id] }),
+        planningStartDate: anchorDate,
+        ...(Number.isFinite(anchorStart) && anchorDate
           ? {
               manualInsertionAnchor: {
-                date: timeData.scheduled_date,
+                date: anchorDate,
                 start: anchorStart,
               },
             }
@@ -4775,6 +4798,7 @@ export default function TicketDetail() {
                   }
 
                   await finalizeStatusChange("in_progress", {
+                    overrideStartDate: nowInfo.date,
                     overrideStartTime: nowInfo.roundedTime || nowInfo.time,
                     remainingEffortHours: nextRemaining,
                     auditAction: "ticket_resumed",
